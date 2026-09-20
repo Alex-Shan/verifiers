@@ -20,6 +20,12 @@ class ContainerConfig(BaseConfig):
     image: str = "python:3.11-slim"
     workdir: str | None = None
     """Working directory override; None uses the task's workdir, or /app."""
+    host_proxy: str | None = None
+    """Optional HTTP(S) proxy reachable through host.docker.internal.
+
+    This is intended for setup-time package downloads. The Docker runtime may
+    replace it with the Verifiers egress proxy after execution is prepared.
+    """
     # TaskData.resources uses these units; non-default runtime config values take precedence.
     cpu: float | None = None
     """Pin the container to this many CPU cores. None = unlimited."""

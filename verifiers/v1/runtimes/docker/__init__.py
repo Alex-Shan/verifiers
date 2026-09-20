@@ -150,11 +150,15 @@ class DockerRuntime(ContainerRuntime):
                 "--sysctl",
                 "net.ipv6.conf.all.disable_ipv6=1",
             ]
-        if sys.platform != "linux":
+        if sys.platform != "linux" or self.config.host_proxy:
             options += ["--add-host", f"{_PROXY_HOST}:host-gateway"]
+        container_env = dict(self.env)
+        if self.config.host_proxy:
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                container_env[key] = self.config.host_proxy
         env_args = [
             arg
-            for key, value in self.env.items()
+            for key, value in container_env.items()
             for arg in ("--env", f"{key}={value}")
         ]
         run = await cli(
