@@ -67,6 +67,20 @@ class GEPAConfig(BaseConfig):
     """Train tasks sampled per reflection step."""
     reflection_columns: list[str] = Field(default_factory=list)
     """Extra per-trace fields (from `trace.info`, else `task`) to surface to the teacher LM."""
+    constraint: str = (
+        "When improving the prompt, do NOT copy specific examples,keywords, usernames, "
+        "or verbatim phrases from these examples. Generalize to rules that apply broadly."
+        "Improve task reward while keeping the prompt concise."
+    )
+    """Instruction included in each reflective example for the teacher LM."""
+    l_target: int = Field(8000, gt=0)
+    """Target completion length used by the brevity score."""
+    k: int = Field(3000, gt=0)
+    """Scale used by the brevity score's sigmoid."""
+    use_wandb: bool = True
+    """Whether GEPA should report the optimization run to Weights & Biases."""
+    wandb_project: str = "GEPA"
+    """Weights & Biases project name for the optimization run."""
     initial_prompt: str | None = None
     """Seed system prompt. None = the first loaded task's `Task.system_prompt`, if any task
     sets one (see `resolve_gepa_seed_prompt`)."""
@@ -86,6 +100,9 @@ class GEPAConfig(BaseConfig):
     dry_run: bool = Field(False, exclude=True)
     """Resolve + validate the config and dump it, then exit. Excluded from the
     saved config so re-running `@ configs/gepa.json` runs for real."""
+    clean: bool = Field(False, exclude=True)
+    """Delete the run directory (`output_dir / run.dir`) before running, overwriting a
+    previous run's results. Excluded from the saved config."""
 
     @model_validator(mode="after")
     def auto_setup_run_name(self):

@@ -69,7 +69,8 @@ class GSM8KTaskset(vf.Taskset[GSM8KTask, GSM8KConfig]):
             GSM8KTask(
                 GSM8KData(
                     idx=i,
-                    prompt=f"{SYSTEM}\n\n{row['question']}",
+                    system_prompt=SYSTEM,
+                    prompt=f"{row['question']}",
                     answer=row["answer"].split("####")[-1].strip(),
                 ),
                 self.config.task,

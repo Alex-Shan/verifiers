@@ -1,0 +1,51 @@
+# export OPENROUTER_API_KEY
+# 用法: uv run vf-gepa @ configs/gepa/gsm8k.toml
+
+num_train = 20
+num_val = 5
+reflection_minibatch_size = 2
+shuffle = true
+seed = 42
+max_total_rollouts = 100
+max_concurrent = 256
+clean = true
+# dry_run = true
+# push = false
+output_dir = "outputs/gepa"
+
+model = "deepseek/deepseek-v4-flash-0731"
+reflection_model = "deepseek/deepseek-v4-flash-0731"
+
+
+# ---------- 模型客户端 ----------
+[client]
+# base_url = "http://localhost:8000/v1"
+# api_key_var = "VLLM_API_KEY"
+
+base_url = "https://openrouter.ai/api/v1"
+api_key_var = "OPENROUTER_API_KEY"
+
+[reflection_client]
+base_url = "https://openrouter.ai/api/v1"
+api_key_var = "OPENROUTER_API_KEY"
+
+
+# ---------- 环境配置 ----------
+[env.taskset]
+id = "gsm8k"
+
+[env.agent.harness]
+id = "null"
+[env.agent.runtime]
+type = "subprocess"
+
+# # ---------- 采样参数 ----------
+# [sampling]
+# max_tokens = 32768
+# # reasoning_effort = "medium"
+# temperature = 0.6
+# top_p = 0.95
+# top_k = 20
+# min_p = 0.0
+# presence_penalty = 1.0
+# # repetition_penalty = 1.0

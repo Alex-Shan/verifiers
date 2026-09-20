@@ -9,8 +9,11 @@ thread, so a Ctrl-C unwinds straight through `optimize()` into the runner's tear
 """
 
 import asyncio
+import json
+import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from gepa.core.adapter import EvaluationBatch
@@ -46,6 +49,10 @@ class GEPAAdapter:
     """Part of GEPA's adapter protocol — its proposer reads this attribute on every reflection
     step. None = use GEPA's default reflection-LM proposer (the AttributeError from leaving it
     undeclared silently disables all mutation proposals)."""
+    constraint: str = ""
+    l_target: int = 8000
+    k: int = 3000
+    reflective_dataset_path: Path | None = None
 
     def evaluate(
         self,
@@ -81,6 +88,9 @@ class GEPAAdapter:
         )
         return list(results)
 
+    def brevity_score(self, n_tokens: int):
+        return 1.0 / (1.0 + math.exp((n_tokens - self.l_target) / self.k))
+
     def make_reflective_dataset(
         self,
         candidate: Candidate,  # Required by GEPA's adapter protocol.
@@ -91,14 +101,21 @@ class GEPAAdapter:
         from `eval_batch.trajectories` (episodes captured by a prior
         `evaluate(capture_traces=True)` on the same batch) — one record per trace, so a
         multi-agent episode shows the teacher every seat's turn (stamped with its role)."""
+
+
         episodes = eval_batch.trajectories or []
         records = []
         for episode in episodes:
             for trace in episode.traces:
+                num_output_tokens = trace.num_output_tokens
+                brevity_socre = self.brevity_score(num_output_tokens)
                 record: dict[str, Any] = {
-                    "query": trace.task.data.prompt_text,
-                    "completion": trace.last_reply,
+                    "query": trace.task.data.prompt,
+                    "completion": [to_jsonable_python(node.message) for node in trace.nodes],
                     "reward": trace.reward,
+                    "brevity_socre":brevity_socre,
+                    "num_output_tokens":trace.num_output_tokens,
+                    "constraint": self.constraint,
                 }
                 record["agent"] = trace.agent.name
                 if trace.has_error:
@@ -113,6 +130,10 @@ class GEPAAdapter:
                             getattr(trace.task.data, column)
                         )
                 records.append(record)
+        if self.reflective_dataset_path is not None:
+            with self.reflective_dataset_path.open("a", encoding="utf-8") as file:
+                for record in records:
+                    file.write(json.dumps(record, ensure_ascii=False) + "\n")
         return {comp: records for comp in components_to_update}
 
 

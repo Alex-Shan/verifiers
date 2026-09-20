@@ -7,9 +7,11 @@ rollouts — a Ctrl-C raises on the main thread inside `optimize()` and unwinds 
 
 import asyncio
 import logging
+from pathlib import Path
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
+from gepa.strategies.proposal_sampling import PxNSampling
 
 from verifiers.v1.cli.output import append_episode, output_path, save_config
 from verifiers.v1.clients import ModelContext
@@ -49,10 +51,19 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
     tasks_by_idx = {task.data.idx: task for task in selected_tasks}
 
     run_dir = output_path(config) if config.save_results else None
+    reflective_dataset_path = (
+        run_dir / "reflective_dataset.jsonl" if run_dir is not None else None
+    )
+
+    if config.use_wandb:
+        wandb_dir = Path(run_dir) / "wandb" if run_dir is not None else None
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+
     if run_dir is not None:
         save_config(
             config, run_dir, "gepa.json"
         )  # resolved config + a fresh traces.jsonl (like run_eval)
+        reflective_dataset_path.write_text("", encoding="utf-8")
         logger.info("results: %s", run_dir)
 
     # optimize() is synchronous and blocking, so it drives the run from this (main) thread. We
@@ -92,6 +103,10 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 semaphore=semaphore,
                 on_complete=on_complete,
                 reflection_columns=config.reflection_columns,
+                constraint=config.constraint,
+                l_target=config.l_target,
+                k=config.k,
+                reflective_dataset_path=reflective_dataset_path,
             )
             optimize_kwargs: dict = {
                 "seed_candidate": {"system_prompt": seed_prompt},
@@ -106,6 +121,20 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 "display_progress_bar": False,
                 "skip_perfect_score": False,
                 "logger": _GEPALog(),
+                "use_wandb": config.use_wandb,
+                "wandb_init_kwargs": {
+                    "project": config.wandb_project,
+                    "name": config.run.name,
+                    "dir": str(wandb_dir) if wandb_dir is not None else None,
+                    "config": {
+                        "model": config.model,
+                        "num_train": config.num_train,
+                        "num_val": config.num_val,
+                        "max_total_rollouts": config.max_total_rollouts,
+                        "seed": config.seed,
+                    },
+                },
+                "sampling_strategy": PxNSampling(p=2, n=2),
             }
             result = optimize(**optimize_kwargs)
             if run_dir is not None:

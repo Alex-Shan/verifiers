@@ -9,6 +9,7 @@ and the actual parse is `pydantic_config.cli`.
 """
 
 import logging
+import shutil
 import sys
 
 from pydantic_config import cli
@@ -69,19 +70,29 @@ def main(argv: list[str] | None = None) -> None:
             "gepa optimizes one agent's prompt against per-trace rewards and can't "
             "drive a multi-agent interaction — only eval runs those"
         )
+    run_path = output_path(config)
+    if config.clean and run_path.exists():
+        output_dir = config.output_dir.resolve()
+        resolved_run_path = run_path.resolve()
+        if resolved_run_path == output_dir or not resolved_run_path.is_relative_to(
+            output_dir
+        ):
+            raise SystemExit("--clean requires run.dir to name a child of output_dir")
+        shutil.rmtree(run_path)
+
     # A named run directory is never silently reused: any write into it — the dry-run
     # config included, which would destroy the existing traces' config provenance —
     # would overwrite the previous run.
-    traces_file = output_path(config) / TRACES_FILE
+    traces_file = run_path / TRACES_FILE
     if traces_file.exists() and traces_file.stat().st_size > 0:
         raise SystemExit(
-            f"run directory {output_path(config)} already contains results - "
+            f"run directory {run_path} already contains results - "
             "pick another --run.name or delete it"
         )
 
     if config.dry_run:  # resolved + validated; write it to the output dir and exit
         logger.info(
-            "wrote config to %s", write_config(config, output_path(config), "gepa.json")
+            "wrote config to %s", write_config(config, run_path, "gepa.json")
         )
         return
 
