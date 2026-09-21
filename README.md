@@ -13,6 +13,9 @@
 git tag verifiers-v0.3.2
 git push origin verifiers-v0.3.2
 
+git tag -f verifiers-v0.3.2 HEAD
+git push -f origin verifiers-v0.3.2
+
 verifiers is our library for creating environments to train and evaluate LLMs.
 
 verifiers is tightly integrated with the [Environments Hub](https://app.primeintellect.ai/dashboard/environments?ex_sort=most_stars), as well as our training framework [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl) and our [Hosted Training](https://app.primeintellect.ai/dashboard/training) platform.
