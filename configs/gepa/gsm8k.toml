@@ -9,6 +9,7 @@ seed = 42
 max_total_rollouts = 100
 max_concurrent = 256
 clean = true
+use_wandb = false
 # dry_run = true
 # push = false
 output_dir = "outputs/gepa"

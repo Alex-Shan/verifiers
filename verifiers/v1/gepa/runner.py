@@ -7,7 +7,6 @@ rollouts — a Ctrl-C raises on the main thread inside `optimize()` and unwinds 
 
 import asyncio
 import logging
-from pathlib import Path
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
@@ -55,8 +54,9 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
         run_dir / "reflective_dataset.jsonl" if run_dir is not None else None
     )
 
-    if config.use_wandb:
-        wandb_dir = Path(run_dir) / "wandb" if run_dir is not None else None
+    wandb_dir = None
+    if config.use_wandb and run_dir is not None:
+        wandb_dir = run_dir / "wandb"
         wandb_dir.mkdir(parents=True, exist_ok=True)
 
     if run_dir is not None:
@@ -119,7 +119,8 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 "run_dir": str(run_dir) if run_dir is not None else None,
                 "seed": config.seed,
                 "display_progress_bar": False,
-                "skip_perfect_score": False,
+                "skip_perfect_score": True,
+                "perfect_score": 1.0,
                 "logger": _GEPALog(),
                 "use_wandb": config.use_wandb,
                 "wandb_init_kwargs": {

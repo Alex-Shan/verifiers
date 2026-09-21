@@ -108,12 +108,12 @@ class GEPAAdapter:
         for episode in episodes:
             for trace in episode.traces:
                 num_output_tokens = trace.num_output_tokens
-                brevity_socre = self.brevity_score(num_output_tokens)
+                brevity_score = self.brevity_score(num_output_tokens)
                 record: dict[str, Any] = {
-                    "query": trace.task.data.prompt,
+                    "query": to_jsonable_python(trace.task.data.prompt),
                     "completion": [to_jsonable_python(node.message) for node in trace.nodes],
                     "reward": trace.reward,
-                    "brevity_socre":brevity_socre,
+                    "brevity_score":brevity_score,
                     "num_output_tokens":trace.num_output_tokens,
                     "constraint": self.constraint,
                 }
