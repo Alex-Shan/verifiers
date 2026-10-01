@@ -1,10 +1,30 @@
 # gsm8k — grade-school math, bash harness; a few tasks with several rollouts each.
 #
 #   uv run vf-eval gsm8k @ configs/gsm8k.toml
-num_rollouts = 3
+num_rollouts = 2
+
+model = "deepseek/deepseek-v4-flash-0731"
+push = false
+
+[client]
+# base_url = "http://localhost:8000/v1"
+# api_key_var = "VLLM_API_KEY"
+
+base_url = "https://openrouter.ai/api/v1"
+api_key_var = "OPENROUTER_API_KEY"
 
 [select]
-limit = 5
+limit = 2
 
 [env.taskset]
 id = "gsm8k"
+
+
+[env.agent.harness]
+id = "claude_code"
+[env.agent.runtime]
+type = "docker"
+image = "alexshan2docker/harness-env:v0.0.1"
+# host_proxy = "http://host.docker.internal:7890"
+# [env.agent.timeout]
+# setup = 300
