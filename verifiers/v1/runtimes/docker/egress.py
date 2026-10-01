@@ -9,7 +9,7 @@ import socket
 import ssl
 from dataclasses import dataclass, replace
 from ipaddress import ip_address
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import h11
 
@@ -124,8 +124,16 @@ class _Callback:
 
 
 class EgressProxy:
-    def __init__(self, policy: NetworkPolicy) -> None:
+    def __init__(
+        self, policy: NetworkPolicy, *, upstream_proxy: str | None = None
+    ) -> None:
         self.policy = policy
+        self.upstream_proxy = urlsplit(upstream_proxy) if upstream_proxy else None
+        if self.upstream_proxy and (
+            self.upstream_proxy.scheme not in ("http", "https", "socks5", "socks5h")
+            or not self.upstream_proxy.hostname
+        ):
+            raise ValueError("unsupported upstream proxy URL")
         self.token = secrets.token_urlsafe(32)
         self._authorization = b"Basic " + base64.b64encode(
             f"verifiers:{self.token}".encode()
@@ -135,6 +143,131 @@ class EgressProxy:
         self._handlers: set[asyncio.Task] = set()
         self.server: asyncio.Server | None = None
         self.port = 0
+
+    async def _proxy_connect(
+        self, address: str, port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Tunnel to a policy-checked numeric address, never resolve it at the proxy."""
+        proxy = self.upstream_proxy
+        assert proxy is not None
+        tls = proxy.scheme == "https"
+        # Unlike the container, this process connects from the local host. Keep the
+        # original name for TLS verification, and never rewrite URL credentials.
+        dial_host = (
+            "127.0.0.1" if proxy.hostname == "host.docker.internal" else proxy.hostname
+        )
+        reader, writer = await asyncio.open_connection(
+            dial_host,
+            proxy.port or (443 if tls else 80 if proxy.scheme == "http" else 1080),
+            ssl=ssl.create_default_context() if tls else None,
+            server_hostname=proxy.hostname if tls else None,
+        )
+        try:
+            username = unquote(proxy.username or "").encode()
+            password = unquote(proxy.password or "").encode()
+            if proxy.scheme in ("http", "https"):
+                authority = (
+                    f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+                )
+                headers = [(b"Host", authority.encode())]
+                if proxy.username is not None:
+                    headers.append(
+                        (
+                            b"Proxy-Authorization",
+                            b"Basic " + base64.b64encode(username + b":" + password),
+                        )
+                    )
+                connection = h11.Connection(h11.CLIENT)
+                writer.write(
+                    connection.send(
+                        h11.Request(
+                            method=b"CONNECT",
+                            target=authority.encode(),
+                            headers=headers,
+                        )
+                    )
+                )
+                await writer.drain()
+                while True:
+                    connection.receive_data(await reader.readuntil(b"\r\n\r\n"))
+                    response = connection.next_event()
+                    if isinstance(response, h11.InformationalResponse):
+                        continue
+                    if (
+                        not isinstance(response, h11.Response)
+                        or response.status_code != 200
+                    ):
+                        raise ConnectionError("upstream proxy refused CONNECT")
+                    break
+            else:
+                # Offer only the configured authentication method, without downgrade.
+                method = 2 if proxy.username is not None else 0
+                writer.write(bytes((5, 1, method)))
+                await writer.drain()
+                if await reader.readexactly(2) != bytes((5, method)):
+                    raise ConnectionError("SOCKS5 authentication method rejected")
+                if method == 2:
+                    if not 1 <= len(username) <= 255 or not 1 <= len(password) <= 255:
+                        raise ValueError(
+                            "SOCKS5 credentials must contain 1 to 255 bytes"
+                        )
+                    writer.write(
+                        bytes((1, len(username)))
+                        + username
+                        + bytes((len(password),))
+                        + password
+                    )
+                    await writer.drain()
+                    if await reader.readexactly(2) != b"\x01\x00":
+                        raise ConnectionError("SOCKS5 authentication failed")
+                destination = ip_address(address)
+                writer.write(
+                    bytes((5, 1, 0, 1 if destination.version == 4 else 4))
+                    + destination.packed
+                    + port.to_bytes(2, "big")
+                )
+                await writer.drain()
+                version, status, reserved, kind = await reader.readexactly(4)
+                if (version, status, reserved) != (5, 0, 0):
+                    raise ConnectionError("SOCKS5 connection rejected")
+                if kind == 1:
+                    length = 4
+                elif kind == 4:
+                    length = 16
+                elif kind == 3:
+                    length = (await reader.readexactly(1))[0]
+                else:
+                    raise ConnectionError("invalid SOCKS5 address type")
+                await reader.readexactly(length + 2)
+            return reader, writer
+        except BaseException:
+            writer.close()
+            raise
+
+    async def _connect_upstream(
+        self, addresses: list, host: str, *, tls: bool, use_proxy: bool
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Connect only to previously checked addresses; never fall back around a proxy."""
+        for family, _, _, _, address in addresses:
+            try:
+                if use_proxy and self.upstream_proxy is not None:
+                    return await asyncio.wait_for(
+                        self._proxy_connect(address[0], address[1]), _HEADER_TIMEOUT
+                    )
+                return await asyncio.wait_for(
+                    asyncio.open_connection(
+                        address[0],
+                        address[1],
+                        family=family,
+                        flags=socket.AI_NUMERICHOST,
+                        ssl=True if tls else None,
+                        server_hostname=host if tls else None,
+                    ),
+                    _HEADER_TIMEOUT,
+                )
+            except (OSError, TimeoutError):
+                continue
+        raise ConnectionError("could not connect to upstream")
 
     def callback_url(self, url: str, host_alias: str = HOST_ALIAS) -> str:
         """Route one framework-owned host-loopback HTTP(S)/WebSocket origin."""
@@ -257,6 +390,7 @@ class EgressProxy:
                 and self.policy.permits(scheme, host, port, connect=connect)
             )
             addresses = []
+            framework = False
             if permitted:
                 dial_host = host
                 if host.lower() == HOST_ALIAS:
@@ -290,24 +424,12 @@ class EgressProxy:
                 await _drain(writer)
                 return
             tls = callback is not None and scheme == "https"
-            for family, _, _, _, address in addresses:
-                try:
-                    upstream_reader, upstream_writer = await asyncio.wait_for(
-                        asyncio.open_connection(
-                            address[0],
-                            address[1],
-                            family=family,
-                            flags=socket.AI_NUMERICHOST,
-                            ssl=True if tls else None,
-                            server_hostname=host if tls else None,
-                        ),
-                        _HEADER_TIMEOUT,
-                    )
-                    break
-                except (OSError, TimeoutError):
-                    continue
-            if upstream_reader is None or upstream_writer is None:
-                raise ConnectionError(f"could not connect to {host}:{port}")
+            upstream_reader, upstream_writer = await self._connect_upstream(
+                addresses,
+                host,
+                tls=tls,
+                use_proxy=callback is None and not framework,
+            )
             if connect:
                 response_started = True
                 writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")

@@ -136,7 +136,10 @@ class DockerRuntime(ContainerRuntime):
             runtime.info.workdir = runtime.config.workdir
             runtime._service_url = service_url
             if host is None and service_url is not None:
-                runtime._proxy = EgressProxy(NetworkPolicy(NetworkPolicyConfig(), []))
+                runtime._proxy = EgressProxy(
+                    NetworkPolicy(NetworkPolicyConfig(), []),
+                    upstream_proxy=runtime._upstream_proxy,
+                )
                 if sys.platform == "linux":
                     await runtime._proxy.start(
                         listener=await runtime._container_listener()
@@ -146,6 +149,28 @@ class DockerRuntime(ContainerRuntime):
             yield runtime
         finally:
             await runtime.stop()
+
+    @property
+    def _upstream_proxy(self) -> str | None:
+        if self._host is None and isinstance(self.config, ContainerConfig):
+            return self.config.host_proxy
+        return None
+
+    def _setup_proxy_env(self) -> dict[str, str]:
+        proxy = self._upstream_proxy
+        if not proxy:
+            return {}
+        return {
+            key: proxy
+            for key in (
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            )
+        }
 
     @property
     def published_port(self) -> int:
@@ -221,11 +246,11 @@ class DockerRuntime(ContainerRuntime):
                 "--sysctl",
                 "net.ipv6.conf.all.disable_ipv6=1",
             ]
-        if sys.platform != "linux":
+        if sys.platform != "linux" or self._upstream_proxy:
             options += ["--add-host", f"{_PROXY_HOST}:host-gateway"]
         env_args = [
             arg
-            for key, value in self.env.items()
+            for key, value in {**self.env, **self._setup_proxy_env()}.items()
             for arg in ("--env", f"{key}={value}")
         ]
         run = await cli(
@@ -313,7 +338,8 @@ class DockerRuntime(ContainerRuntime):
                 NetworkPolicyConfig(allow=["*"] if restricted else []),
                 [],
                 allow_non_global=restricted,
-            )
+            ),
+            upstream_proxy=self._upstream_proxy,
         )
         if sys.platform == "linux":
             await self._proxy.start(listener=await self._container_listener())
@@ -497,6 +523,8 @@ class DockerRuntime(ContainerRuntime):
             "HTTPS_PROXY": proxy,
             "http_proxy": proxy,
             "https_proxy": proxy,
+            "ALL_PROXY": proxy,
+            "all_proxy": proxy,
             "NO_PROXY": f"localhost,127.0.0.1,{_PROXY_HOST}",
             "no_proxy": f"localhost,127.0.0.1,{_PROXY_HOST}",
         }
@@ -511,6 +539,9 @@ class DockerRuntime(ContainerRuntime):
         if self.network_restricted and self._cut:
             env = {**env, **self._proxy_env()}
         else:
+            # A setup server may already carry the framework proxy so it survives
+            # the execution-time network cut. Preserve explicit process values.
+            env = {**self._setup_proxy_env(), **env}
             values = {**self._image_env, **env}
             exclusions = dict.fromkeys(
                 entry.strip()
