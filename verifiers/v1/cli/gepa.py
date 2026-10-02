@@ -10,6 +10,7 @@ and the actual parse is `pydantic_config.cli`.
 
 import logging
 import os
+import shutil
 import sys
 import uuid
 
@@ -24,6 +25,7 @@ from verifiers.v1.cli.resolve import (
     references_config_file,
     with_positional_taskset,
 )
+from verifiers.v1.configs.agent import agent_config_fields
 from verifiers.v1.gepa import GEPAConfig, run_gepa
 from verifiers.v1.utils.interrupt import install_interrupt
 from verifiers.v1.utils.logging import setup_logging
@@ -62,32 +64,39 @@ def main(argv: list[str] | None = None) -> None:
         sys.argv = [sys.argv[0], *argv]  # let prime-pydantic-config render help/errors
         config = cli(config_type)
     setup_logging("DEBUG" if config.verbose else "INFO")
-    # Refuse multi-agent before the dry-run return, so --dry-run can't write a
-    # config the real invocation would reject.
+    # GEPA optimizes one shared prompt. A custom env may produce several traces
+    # from one role; the adapter scores those together as an episode.
     env_cls = vf.environment_class(
         config.env.taskset.id,
         config.env.id,
     )
-    if not issubclass(env_cls, vf.SingleAgentEnv):
+    if len(agent_config_fields(config.env)) != 1:
         raise SystemExit(
-            f"gepa: {config.env.env_id!r} runs {env_cls.__name__}, a multi-agent env; "
-            "gepa optimizes one agent's prompt against per-trace rewards and can't "
-            "drive a multi-agent interaction — only eval runs those"
+            f"gepa: {config.env.env_id!r} runs {env_cls.__name__} with "
+            "multiple agent roles; GEPA optimizes one shared system prompt"
         )
+    run_path = output_path(config)
+    if config.clean and run_path.exists():
+        output_dir = config.output_dir.resolve()
+        resolved_run_path = run_path.resolve()
+        if resolved_run_path == output_dir or not resolved_run_path.is_relative_to(
+            output_dir
+        ):
+            raise SystemExit("--clean requires run.dir to name a child of output_dir")
+        shutil.rmtree(run_path)
+
     # A named run directory is never silently reused: any write into it — the dry-run
     # config included, which would destroy the existing traces' config provenance —
     # would overwrite the previous run.
-    traces_file = output_path(config) / TRACES_FILE
+    traces_file = run_path / TRACES_FILE
     if traces_file.exists() and traces_file.stat().st_size > 0:
         raise SystemExit(
-            f"run directory {output_path(config)} already contains results - "
+            f"run directory {run_path} already contains results - "
             "pick another --run.name or delete it"
         )
 
     if config.dry_run:  # resolved + validated; write it to the output dir and exit
-        logger.info(
-            "wrote config to %s", write_config(config, output_path(config), "gepa.json")
-        )
+        logger.info("wrote config to %s", write_config(config, run_path, "gepa.json"))
         return
 
     # First Ctrl-C / SIGTERM warns and raises KeyboardInterrupt so a killed/timed-out run still

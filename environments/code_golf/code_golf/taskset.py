@@ -115,7 +115,8 @@ class CodeGolfTaskset(vf.Taskset[CodeGolfTask, vf.TasksetConfig]):
             CodeGolfTask(
                 CodeGolfData(
                     name=name,
-                    prompt=f"{SYSTEM}\n\nPrint {description}.",
+                    system_prompt=SYSTEM,
+                    prompt=f"{description}",
                     expected=expected,
                 ),
                 self.config.task,

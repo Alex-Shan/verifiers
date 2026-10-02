@@ -1,0 +1,35 @@
+# 用法: uv run vf-gepa @ configs/gepa/reverse_text.toml
+# 运行前设置 OPENROUTER_API_KEY。
+
+model = "google/gemini-2.5-flash-lite"
+reflection_model = "deepseek/deepseek-v4.1-flash"
+
+num_train = 100
+num_val = 20
+reflection_minibatch_size = 3
+max_iterations = 10
+max_concurrent = 128
+
+# gr_gepa = true
+# group_size = 4
+# group_alpha = 0.8
+seed = 42
+use_wandb = false
+output_dir = "outputs/gepa"
+
+[select]
+shuffle = true
+seed = 42
+
+[client]
+base_url = "https://openrouter.ai/api/v1"
+api_key_var = "OPENROUTER_API_KEY"
+
+[env.taskset]
+id = "reverse-text"
+
+[env.agent.harness]
+id = "null"
+
+[env.agent.runtime]
+type = "subprocess"

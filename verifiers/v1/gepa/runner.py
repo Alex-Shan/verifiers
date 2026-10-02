@@ -10,6 +10,8 @@ import logging
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
+from gepa.strategies.proposal_sampling import PxNSampling
+from gepa.utils import MaxCandidateProposalsStopper, NoImprovementStopper
 
 from verifiers.v1.cli.output import output_path, save_config
 from verifiers.v1.clients import ModelContext
@@ -36,6 +38,26 @@ class _GEPALog:
         logger.info(message)
 
 
+def _stopping_kwargs(config: GEPAConfig) -> dict:
+    if config.max_total_rollouts is not None:
+        # GEPA counts task evaluations on validation, so use task groups as
+        # the common budget unit in both train and validation phases.
+        return {
+            "max_metric_calls": config.max_total_rollouts
+            // (config.group_size if config.gr_gepa else 1)
+        }
+    if config.max_iterations is not None:
+        # This stopper checks GEPA's state.i, which counts completed loop
+        # iterations even when PxNSampling proposes several candidates.
+        return {"stop_callbacks": MaxCandidateProposalsStopper(config.max_iterations)}
+    assert config.max_iterations_without_improvement is not None
+    return {
+        "stop_callbacks": NoImprovementStopper(
+            config.max_iterations_without_improvement
+        )
+    }
+
+
 def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
     logger.info("gepa config:\n%s", config.model_dump_json(indent=2))
     taskset = env.taskset.select(config.select)
@@ -48,10 +70,20 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
     tasks_by_idx = {task.data.idx: task for task in selected_tasks}
 
     run_dir = output_path(config) if config.save_results else None
+    reflective_dataset_path = (
+        run_dir / "reflective_dataset.jsonl" if run_dir is not None else None
+    )
+
+    wandb_dir = None
+    if config.use_wandb and run_dir is not None:
+        wandb_dir = run_dir / "wandb"
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+
     if run_dir is not None:
         save_config(
             config, run_dir, "gepa.json"
         )  # resolved config + a fresh traces.jsonl (like run_eval)
+        reflective_dataset_path.write_text("", encoding="utf-8")
         logger.info("results: %s", run_dir)
 
     # optimize() is synchronous and blocking, so it drives the run from this (main) thread. We
@@ -91,6 +123,12 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 semaphore=semaphore,
                 on_complete=on_complete,
                 reflection_columns=config.reflection_columns,
+                constraint=config.constraint,
+                reflective_dataset_path=reflective_dataset_path,
+                gr_gepa=config.gr_gepa,
+                group_size=config.group_size,
+                group_alpha=config.group_alpha,
+                group_success_threshold=config.group_success_threshold,
             )
             optimize_kwargs: dict = {
                 "seed_candidate": {"system_prompt": seed_prompt},
@@ -98,14 +136,31 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 "valset": [task.data.idx for task in val_tasks],
                 "adapter": adapter,
                 "reflection_lm": reflection_lm,
-                "max_metric_calls": config.max_total_rollouts,
                 "reflection_minibatch_size": config.reflection_minibatch_size,
                 "run_dir": str(run_dir) if run_dir is not None else None,
                 "seed": config.seed,
                 "display_progress_bar": False,
-                "skip_perfect_score": False,
+                "skip_perfect_score": True,
+                "perfect_score": 1.0,
                 "logger": _GEPALog(),
+                "use_wandb": config.use_wandb,
+                "wandb_init_kwargs": {
+                    "project": config.wandb_project,
+                    "name": config.run.name,
+                    "dir": str(wandb_dir) if wandb_dir is not None else None,
+                    "config": {
+                        "model": config.model,
+                        "num_train": config.num_train,
+                        "num_val": config.num_val,
+                        "max_total_rollouts": config.max_total_rollouts,
+                        "max_iterations": config.max_iterations,
+                        "max_iterations_without_improvement": config.max_iterations_without_improvement,
+                        "seed": config.seed,
+                    },
+                },
+                "sampling_strategy": PxNSampling(p=2, n=2),
             }
+            optimize_kwargs.update(_stopping_kwargs(config))
             result = optimize(**optimize_kwargs)
             if run_dir is not None:
                 # Persist the winning prompt as a plain file so it can be handed straight to
