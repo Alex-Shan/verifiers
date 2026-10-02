@@ -40,12 +40,7 @@ class _GEPALog:
 
 def _stopping_kwargs(config: GEPAConfig) -> dict:
     if config.max_total_rollouts is not None:
-        # GEPA counts task evaluations on validation, so use task groups as
-        # the common budget unit in both train and validation phases.
-        return {
-            "max_metric_calls": config.max_total_rollouts
-            // (config.group_size if config.gr_gepa else 1)
-        }
+        return {"max_metric_calls": config.max_total_rollouts}
     if config.max_iterations is not None:
         # This stopper checks GEPA's state.i, which counts completed loop
         # iterations even when PxNSampling proposes several candidates.
@@ -120,6 +115,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 ctx=ctx,
                 tasks=tasks_by_idx,
                 loop=loop,
+                train_task_ids={task.data.idx for task in train_tasks},
                 semaphore=semaphore,
                 on_complete=on_complete,
                 reflection_columns=config.reflection_columns,

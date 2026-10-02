@@ -64,7 +64,7 @@ class GEPAConfig(BaseConfig):
 
     max_total_rollouts: int | None = Field(None, ge=1)
     """Rollout budget. Defaults to 500 when no other stopping condition is selected.
-    In GR-GEPA, each task evaluation uses `group_size` rollouts."""
+    In GR-GEPA, each training task uses `group_size` rollouts; validation uses one."""
     max_iterations: int | None = Field(None, ge=1)
     """Stop after this many GEPA optimization iterations."""
     max_iterations_without_improvement: int | None = Field(None, ge=1)
@@ -72,9 +72,9 @@ class GEPAConfig(BaseConfig):
     reflection_minibatch_size: int = 3
     """Train tasks sampled per reflection step."""
     gr_gepa: bool = False
-    """Compare repeated rollouts of each task under the same candidate prompt."""
+    """Compare repeated rollouts of each training task under the same candidate prompt."""
     group_size: int = Field(4, ge=2)
-    """Rollouts per task when GR-GEPA is enabled."""
+    """Rollouts per training task when GR-GEPA is enabled. Validation always uses one."""
     group_alpha: float = Field(0.9, ge=0, le=1)
     """Weight of task success; the remainder rewards brevity among successful rollouts."""
     group_success_threshold: float = Field(0.9, ge=0, lt=1)

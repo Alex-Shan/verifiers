@@ -41,6 +41,7 @@ class GEPAAdapter:
     ctx: ModelContext
     tasks: dict[int, Task]
     loop: asyncio.AbstractEventLoop
+    train_task_ids: set[int] = field(default_factory=set)
     semaphore: asyncio.Semaphore | None = None
     on_complete: Callable[[Episode], Awaitable[None]] | None = None
     """Called with each rollout's episode as it finalizes — the runner's persist hook that
@@ -55,7 +56,7 @@ class GEPAAdapter:
     gr_gepa: bool = False
     group_size: int = 4
     group_alpha: float = 0.5
-    group_success_threshold: float = 0.9
+    group_success_threshold: float = 1.0
 
     def evaluate(
         self,
@@ -69,38 +70,51 @@ class GEPAAdapter:
         the main thread; each batch's rollouts run on the runner's persistent loop via
         `run_until_complete`."""
         system_prompt = candidate.get("system_prompt", "")
-        n = self.group_size if self.gr_gepa else 1
+        counts = [
+            self.group_size if self.gr_gepa and idx in self.train_task_ids else 1
+            for idx in batch
+        ]
         episodes = self.loop.run_until_complete(
-            self._run_batch(batch, system_prompt, n)
+            self._run_batch(batch, system_prompt, counts)
         )
-        groups = [episodes[i : i + n] for i in range(0, len(episodes), n)]
-        if self.gr_gepa:
-            outputs: list[Trajectory] = groups
-            scores = [
-                sum(
-                    _group_scores(group, self.group_alpha, self.group_success_threshold)
+        outputs: list[Trajectory] = []
+        scores: list[float] = []
+        offset = 0
+        for n in counts:
+            group = episodes[offset : offset + n]
+            offset += n
+            if n > 1:
+                outputs.append(group)
+                scores.append(
+                    sum(
+                        _group_scores(
+                            group, self.group_alpha, self.group_success_threshold
+                        )
+                    )
+                    / n
                 )
-                / n
-                for group in groups
-            ]
-        else:
-            outputs = episodes
-            scores = [_episode_score(episode) for episode in episodes]
+            else:
+                outputs.append(group[0])
+                scores.append(_episode_score(group[0]))
         return EvaluationBatch(
             outputs=outputs,
             scores=scores,
             trajectories=outputs if capture_traces else None,
-            num_metric_calls=len(batch),
+            num_metric_calls=len(episodes),
         )
 
     async def _run_batch(
-        self, batch: list[int], system_prompt: str, n: int
+        self, batch: list[int], system_prompt: str, counts: list[int]
     ) -> list[Episode]:
         # Inject the candidate as a copy of each base task with its system_prompt overridden
         # (`with_system_prompt` copies rather than reconstructs, so subclass state survives and
         # the shared base task in `self.tasks` is left untouched for the next candidate).
         tasks = [self.tasks[idx].with_system_prompt(system_prompt) for idx in batch]
-        slots = [slot for task in tasks for slot in self.env.slots(task, n=n)]
+        slots = [
+            slot
+            for task, n in zip(tasks, counts, strict=True)
+            for slot in self.env.slots(task, n=n)
+        ]
         results = await asyncio.gather(
             *(
                 self.env.run_slot(slot, self.ctx, self.semaphore, self.on_complete)
@@ -172,10 +186,6 @@ class GEPAAdapter:
                 "completion": [
                     to_jsonable_python(node.message) for node in trace.nodes
                 ],
-                "reward": trace.reward,
-                "num_output_tokens": trace.num_output_tokens,
-                "constraint": self.constraint,
-                "agent": trace.agent.name,
             }
             if trace.has_error:
                 record["error"] = str(trace.last_error)
@@ -201,7 +211,7 @@ def _episode_score(episode: Episode) -> float:
 
 
 def _is_success(episode: Episode, threshold: float) -> bool:
-    return episode.ok and _episode_score(episode) > threshold
+    return episode.ok and _episode_score(episode) >= threshold
 
 
 def _group_brevities(episodes: list[Episode], threshold: float) -> list[float]:
