@@ -53,6 +53,14 @@ class GEPAConfig(BaseConfig):
     select: SelectCLIConfig = SelectCLIConfig()
     """Which of the taskset's tasks GEPA splits into train/val, under `--select.*`
     (`-n` sets `select.limit`, `-s` sets `select.shuffle`)."""
+    train_tasks: Path | None = None
+    """Optional JSONL file used as the full training set. Set together with
+    `val_tasks`; the taskset config must expose a `data_path` field."""
+    val_tasks: Path | None = None
+    """Optional JSONL file used as the full validation set. Set together with
+    `train_tasks`; the taskset config must expose a `data_path` field."""
+    shuffle: bool | None = Field(None, exclude=True)
+    """Legacy top-level alias for `select.shuffle`."""
     num_train: int = Field(100, ge=1)
     """Tasks reserved for reflection minibatches (GEPA never scores the full trainset at once)."""
     num_val: int = Field(50, ge=1)
@@ -116,6 +124,17 @@ class GEPAConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_stop_and_setup_run_name(self):
+        if self.shuffle is not None:
+            self.select = self.select.model_copy(update={"shuffle": self.shuffle})
+        if (self.train_tasks is None) != (self.val_tasks is None):
+            raise ValueError("train_tasks and val_tasks must be set together")
+        if self.train_tasks is not None:
+            taskset_fields = type(self.env.taskset).model_fields
+            if "data_path" not in taskset_fields:
+                raise ValueError(
+                    "train_tasks/val_tasks require a taskset config with a `data_path` field"
+                )
+
         stop_values = (
             self.max_total_rollouts,
             self.max_iterations,

@@ -20,6 +20,7 @@ from verifiers.v1.episode import Episode
 from verifiers.v1.gepa.adapter import GEPAAdapter
 from verifiers.v1.gepa.config import GEPAConfig
 from verifiers.v1.gepa.dataset import (
+    load_tasks_from_path,
     resolve_gepa_seed_prompt,
     split_tasks,
 )
@@ -55,9 +56,37 @@ def _stopping_kwargs(config: GEPAConfig) -> dict:
 
 def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
     logger.info("gepa config:\n%s", config.model_dump_json(indent=2))
-    taskset = env.taskset.select(config.select)
-    all_tasks = list(taskset.take(config.num_train + config.num_val))
-    train_tasks, val_tasks = split_tasks(all_tasks, config.num_train, config.num_val)
+    if config.train_tasks is None:
+        taskset = env.taskset.select(config.select)
+        all_tasks = list(taskset.take(config.num_train + config.num_val))
+        train_tasks, val_tasks = split_tasks(
+            all_tasks, config.num_train, config.num_val
+        )
+    else:
+        # Explicit files define the two complete datasets. Load both through the
+        # same taskset implementation so their rows receive the normal task parsing
+        # and scoring configuration.
+        assert config.val_tasks is not None
+        train_tasks = load_tasks_from_path(
+            env.taskset, config.train_tasks, config.select
+        )
+        val_tasks = load_tasks_from_path(env.taskset, config.val_tasks, config.select)
+
+        # Each independently loaded taskset numbers its rows from zero. GEPA keys
+        # tasks by TaskData.idx, so move validation indices past the train indices.
+        next_idx = max(
+            (task.data.idx for task in train_tasks if task.data.idx is not None),
+            default=-1,
+        ) + 1
+        val_tasks = [
+            task.with_data(idx=next_idx + i) for i, task in enumerate(val_tasks)
+        ]
+
+    logger.info(
+        "GEPA dataset sizes: %d train, %d validation",
+        len(train_tasks),
+        len(val_tasks),
+    )
     selected_tasks = [*train_tasks, *val_tasks]
     # Seed from the tasks GEPA actually evaluates (train ∪ val), not the full pre-split pool —
     # a taskset with per-task system prompts could otherwise seed from a task in neither split.
@@ -146,8 +175,8 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                     "dir": str(wandb_dir) if wandb_dir is not None else None,
                     "config": {
                         "model": config.model,
-                        "num_train": config.num_train,
-                        "num_val": config.num_val,
+                        "num_train": len(train_tasks),
+                        "num_val": len(val_tasks),
                         "max_total_rollouts": config.max_total_rollouts,
                         "max_iterations": config.max_iterations,
                         "max_iterations_without_improvement": config.max_iterations_without_improvement,
