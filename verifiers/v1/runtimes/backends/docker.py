@@ -31,6 +31,8 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, ClassVar, Literal
 from urllib.parse import urlsplit
 
+from pydantic import field_validator
+
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.runtimes.backends.subprocess import SubprocessProcess
@@ -68,6 +70,30 @@ control.sendmsg([b"listener"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.arr
 
 class DockerConfig(NetworkPolicyConfig):
     type: Literal["docker"] = "docker"
+    host_proxy: str | None = None
+    """Setup and egress proxy URL: http, https, socks5 or socks5h.
+
+    Use host.docker.internal for a local host proxy. Setup tools must support the
+    selected scheme; restricted egress always resolves and checks destinations locally.
+    HTTP(S) proxies must support CONNECT to the destination port.
+    """
+
+    @field_validator("host_proxy")
+    @classmethod
+    def validate_host_proxy(cls, value: str | None) -> str | None:
+        if value is not None:
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme not in ("http", "https", "socks5", "socks5h")
+                or not parsed.hostname
+                or parsed.path not in ("", "/")
+                or parsed.query
+                or parsed.fragment
+                or parsed.port == 0
+            ):
+                raise ValueError("host_proxy must be an HTTP(S) or SOCKS5 proxy URL")
+        return value
+
     image: str = "python:3.11-slim"
     workdir: str | None = None
     """Working directory override; None uses the task's workdir, or /app."""
@@ -308,6 +334,28 @@ class DockerBackend(RuntimeBackend):
         )
 
     @property
+    def _upstream_proxy(self) -> str | None:
+        if self._host_backend is None and isinstance(self.config, DockerConfig):
+            return self.config.host_proxy
+        return None
+
+    def _setup_proxy_env(self) -> dict[str, str]:
+        proxy = self._upstream_proxy
+        if not proxy:
+            return {}
+        return dict.fromkeys(
+            (
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ),
+            proxy,
+        )
+
+    @property
     def published_port(self) -> int:
         return SERVICE_PORT
 
@@ -340,7 +388,7 @@ class DockerBackend(RuntimeBackend):
         # Engine names are global; cleanup must never target a caller's existing container.
         self._container = f"vf-{uuid.uuid4().hex}"
         options = ["--network", "bridge", "--publish", f"127.0.0.1::{SERVICE_PORT}"]
-        if not _LINUX:
+        if not _LINUX or self._upstream_proxy:
             options += ["--add-host", f"{_HOST_ALIAS}:host-gateway"]
         if self._restricted:
             options += [
@@ -362,7 +410,7 @@ class DockerBackend(RuntimeBackend):
             options += ["--gpus", str(gpu_count)]
         env_args = [
             arg
-            for key, value in self.env.items()
+            for key, value in {**self.env, **self._setup_proxy_env()}.items()
             for arg in ("--env", f"{key}={value}")
         ]
         run = await cli(
@@ -473,7 +521,7 @@ class DockerBackend(RuntimeBackend):
         return "127.0.0.1" if _LINUX else _HOST_ALIAS
 
     async def _start_proxy(self, policy: NetworkPolicy) -> None:
-        self._proxy = EgressProxy(policy)
+        self._proxy = EgressProxy(policy, upstream_proxy=self._upstream_proxy)
         if _LINUX:
             await self._proxy.start(listener=await self._container_listener())
         else:
@@ -658,13 +706,22 @@ class DockerBackend(RuntimeBackend):
             env = {
                 **env,
                 **dict.fromkeys(
-                    ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"), proxy
+                    (
+                        "HTTP_PROXY",
+                        "HTTPS_PROXY",
+                        "ALL_PROXY",
+                        "http_proxy",
+                        "https_proxy",
+                        "all_proxy",
+                    ),
+                    proxy,
                 ),
                 "NO_PROXY": exclusions,
                 "no_proxy": exclusions,
             }
             return self._exec_command(env, stdin=stdin, user=user)
         # Callback URLs must bypass any proxy the image or task configures.
+        env = {**self._setup_proxy_env(), **env}
         values = {**self._image_env, **env}
         exclusions = dict.fromkeys(
             entry.strip()
