@@ -28,12 +28,10 @@ import tempfile
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import urlsplit
 
-from pydantic import field_validator
-
-from verifiers.v1.configs.runtime import NetworkPolicyConfig
+from verifiers.v1.configs.runtime import DockerConfig, NetworkPolicyConfig
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.runtimes.backends.subprocess import SubprocessProcess
 from verifiers.v1.runtimes.base import (
@@ -66,48 +64,6 @@ listener.bind(("127.0.0.1", 0))
 listener.listen()
 control.sendmsg([b"listener"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [listener.fileno()]))])
 """
-
-
-class DockerConfig(NetworkPolicyConfig):
-    type: Literal["docker"] = "docker"
-    host_proxy: str | None = None
-    """Setup and egress proxy URL: http, https, socks5 or socks5h.
-
-    Use host.docker.internal for a local host proxy. Setup tools must support the
-    selected scheme; restricted egress always resolves and checks destinations locally.
-    HTTP(S) proxies must support CONNECT to the destination port.
-    """
-
-    @field_validator("host_proxy")
-    @classmethod
-    def validate_host_proxy(cls, value: str | None) -> str | None:
-        if value is not None:
-            parsed = urlsplit(value)
-            if (
-                parsed.scheme not in ("http", "https", "socks5", "socks5h")
-                or not parsed.hostname
-                or parsed.path not in ("", "/")
-                or parsed.query
-                or parsed.fragment
-                or parsed.port == 0
-            ):
-                raise ValueError("host_proxy must be an HTTP(S) or SOCKS5 proxy URL")
-        return value
-
-    image: str = "python:3.11-slim"
-    workdir: str | None = None
-    """Working directory override; None uses the task's workdir, or /app."""
-    # TaskData.resources uses these units; non-default runtime config values take precedence.
-    cpu: float | None = None
-    """Pin the container to this many CPU cores. None = unlimited."""
-    memory: float | None = None
-    """Hard memory limit in GB. None = unlimited."""
-    gpu: str | None = None
-    """GPU spec, e.g. "A100" or "2". Docker exposes that many GPUs (needs the nvidia
-    container toolkit) and checks requested types with nvidia-smi. None = none."""
-    disk: float | None = None
-    """Advisory disk request in GB. Docker has no portable per-container size limit, so this is accepted (so a task can declare it without a warning) but not
-    enforced."""
 
 
 class DockerRuntimeInfo(DockerConfig, BaseRuntimeInfo):

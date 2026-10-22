@@ -144,12 +144,12 @@ class GEPAAdapter:
                 ):
                     rollouts.append(
                         {
-                            # "success": int(
-                            #     _is_success(episode, self.group_success_threshold)
-                            # ),
+                            "success": _is_success(
+                                episode, self.group_success_threshold
+                            ),
                             "reward": _episode_score(episode),
                             "num_output_tokens": episode.num_output_tokens,
-                            # "relative_brevity": brevity,
+                            "relative_brevity": brevity,
                             "score": score,
                             "traces": self._episode_records(episode),
                             "error": str(episode.last_error)
@@ -185,6 +185,9 @@ class GEPAAdapter:
                 "completion": [
                     to_jsonable_python(node.message) for node in trace.nodes
                 ],
+                "reward": trace.reward,
+                "agent": trace.agent.name,
+                "constraint": self.constraint,
             }
             if trace.has_error:
                 record["error"] = str(trace.last_error)

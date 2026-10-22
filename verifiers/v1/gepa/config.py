@@ -13,12 +13,11 @@ from pathlib import Path
 from pydantic import AliasChoices, Field, SerializeAsAny, model_validator
 from pydantic_config import BaseConfig
 
-from verifiers.v1.clients import EvalClientConfig
 from verifiers.v1.configs.cli.env import narrowed_env_annotation, resolve_env_field
 from verifiers.v1.configs.cli.eval import RunConfig, default_run_name
-from verifiers.v1.configs.env import EnvConfig
+from verifiers.v1.configs.client import EvalClientConfig
+from verifiers.v1.configs.env import EnvConfig, SingleAgentEnvConfig
 from verifiers.v1.configs.select import SelectCLIConfig
-from verifiers.v1.envs.single_agent import SingleAgentEnvConfig
 from verifiers.v1.types import SamplingConfig
 
 
@@ -86,7 +85,7 @@ class GEPAConfig(BaseConfig):
     group_alpha: float = Field(0.9, ge=0, le=1)
     """Weight of task success; the remainder rewards brevity among successful rollouts."""
     group_success_threshold: float = Field(0.9, ge=0, lt=1)
-    """A GR-GEPA rollout succeeds when its reward is strictly above this threshold."""
+    """A GR-GEPA rollout succeeds when its reward reaches this threshold."""
     reflection_columns: list[str] = Field(default_factory=list)
     """Extra per-trace fields (from `trace.info`, else `task`) to surface to the teacher LM."""
     constraint: str = (
@@ -95,7 +94,7 @@ class GEPAConfig(BaseConfig):
         "Improve task reward while keeping the prompt concise."
     )
     """Instruction included in each reflective example for the teacher LM."""
-    use_wandb: bool = True
+    use_wandb: bool = False
     """Whether GEPA should report the optimization run to Weights & Biases."""
     wandb_project: str = "GEPA"
     """Weights & Biases project name for the optimization run."""

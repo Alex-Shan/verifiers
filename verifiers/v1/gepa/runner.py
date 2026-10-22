@@ -74,10 +74,13 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
 
         # Each independently loaded taskset numbers its rows from zero. GEPA keys
         # tasks by TaskData.idx, so move validation indices past the train indices.
-        next_idx = max(
-            (task.data.idx for task in train_tasks if task.data.idx is not None),
-            default=-1,
-        ) + 1
+        next_idx = (
+            max(
+                (task.data.idx for task in train_tasks if task.data.idx is not None),
+                default=-1,
+            )
+            + 1
+        )
         val_tasks = [
             task.with_data(idx=next_idx + i) for i, task in enumerate(val_tasks)
         ]

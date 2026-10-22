@@ -26,9 +26,7 @@ def main() -> None:
         parser.error(f"set {api_key_var} before running the experiments")
 
     run_id = f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{os.getpid()}"
-    # for enabled in (False, True):
-    enabled = True
-    if enabled:
+    for enabled in (False, True):
         mode = "on" if enabled else "off"
         run_name = f"reverse-text-gepa-{run_id}-{mode}"
         print(f"Running {mode}: {config['output_dir']}/{run_name}", flush=True)
