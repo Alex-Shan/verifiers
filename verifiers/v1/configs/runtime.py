@@ -6,7 +6,7 @@ from itertools import product
 from typing import Annotated, Any, Literal, Self
 from urllib.parse import SplitResult, urlsplit
 
-from pydantic import Field, SerializeAsAny, model_validator
+from pydantic import Field, SerializeAsAny, field_validator, model_validator
 from pydantic_config import BaseConfig
 
 
@@ -138,6 +138,30 @@ class SubprocessConfig(BaseConfig):
 
 class DockerConfig(NetworkPolicyConfig):
     type: Literal["docker"] = "docker"
+    host_proxy: str | None = None
+    """Setup and egress proxy URL: http, https, socks5 or socks5h.
+
+    Use host.docker.internal for a local host proxy. Setup tools must support the
+    selected scheme; restricted egress always resolves and checks destinations locally.
+    HTTP(S) proxies must support CONNECT to the destination port.
+    """
+
+    @field_validator("host_proxy")
+    @classmethod
+    def validate_host_proxy(cls, value: str | None) -> str | None:
+        if value is not None:
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme not in ("http", "https", "socks5", "socks5h")
+                or not parsed.hostname
+                or parsed.path not in ("", "/")
+                or parsed.query
+                or parsed.fragment
+                or parsed.port == 0
+            ):
+                raise ValueError("host_proxy must be an HTTP(S) or SOCKS5 proxy URL")
+        return value
+
     image: str = "python:3.11-slim"
     workdir: str | None = None
     """Working directory override; None uses the task's workdir, or /app."""

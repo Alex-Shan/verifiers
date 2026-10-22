@@ -290,6 +290,28 @@ class DockerBackend(RuntimeBackend):
         )
 
     @property
+    def _upstream_proxy(self) -> str | None:
+        if self._host_backend is None and isinstance(self.config, DockerConfig):
+            return self.config.host_proxy
+        return None
+
+    def _setup_proxy_env(self) -> dict[str, str]:
+        proxy = self._upstream_proxy
+        if not proxy:
+            return {}
+        return dict.fromkeys(
+            (
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ),
+            proxy,
+        )
+
+    @property
     def published_port(self) -> int:
         return SERVICE_PORT
 
@@ -322,7 +344,7 @@ class DockerBackend(RuntimeBackend):
         # Engine names are global; cleanup must never target a caller's existing container.
         self._container = f"vf-{uuid.uuid4().hex}"
         options = ["--network", "bridge", "--publish", f"127.0.0.1::{SERVICE_PORT}"]
-        if not _LINUX:
+        if not _LINUX or self._upstream_proxy:
             options += ["--add-host", f"{_HOST_ALIAS}:host-gateway"]
         if self._restricted:
             options += [
@@ -344,7 +366,7 @@ class DockerBackend(RuntimeBackend):
             options += ["--gpus", str(gpu_count)]
         env_args = [
             arg
-            for key, value in self.env.items()
+            for key, value in {**self.env, **self._setup_proxy_env()}.items()
             for arg in ("--env", f"{key}={value}")
         ]
         run = await cli(
@@ -455,7 +477,7 @@ class DockerBackend(RuntimeBackend):
         return "127.0.0.1" if _LINUX else _HOST_ALIAS
 
     async def _start_proxy(self, policy: NetworkPolicy) -> None:
-        self._proxy = EgressProxy(policy)
+        self._proxy = EgressProxy(policy, upstream_proxy=self._upstream_proxy)
         if _LINUX:
             await self._proxy.start(listener=await self._container_listener())
         else:
@@ -640,13 +662,22 @@ class DockerBackend(RuntimeBackend):
             env = {
                 **env,
                 **dict.fromkeys(
-                    ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"), proxy
+                    (
+                        "HTTP_PROXY",
+                        "HTTPS_PROXY",
+                        "ALL_PROXY",
+                        "http_proxy",
+                        "https_proxy",
+                        "all_proxy",
+                    ),
+                    proxy,
                 ),
                 "NO_PROXY": exclusions,
                 "no_proxy": exclusions,
             }
             return self._exec_command(env, stdin=stdin, user=user)
         # Callback URLs must bypass any proxy the image or task configures.
+        env = {**self._setup_proxy_env(), **env}
         values = {**self._image_env, **env}
         exclusions = dict.fromkeys(
             entry.strip()
