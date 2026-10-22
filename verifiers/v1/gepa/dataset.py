@@ -6,7 +6,34 @@ individual tasksets define ad hoc ones inconsistently), so GEPA carves one out o
 disjoint slices.
 """
 
+from pathlib import Path
+
+from verifiers.v1.configs.select import SelectConfig
 from verifiers.v1.task import Task
+from verifiers.v1.taskset import Taskset
+
+
+def load_tasks_from_path(
+    taskset: Taskset, path: Path, select: SelectConfig
+) -> list[Task]:
+    """Load one explicit dataset through the configured taskset's normal parser.
+
+    Separate train/validation files are supported by tasksets whose config exposes a
+    `data_path` field. Reconstructing the same taskset with that path preserves its
+    task conversion, task config, and reward implementation.
+    """
+    if "data_path" not in type(taskset.config).model_fields:
+        raise ValueError(
+            "train_tasks/val_tasks require a taskset config with a `data_path` field"
+        )
+    if not path.is_file():
+        raise FileNotFoundError(f"GEPA dataset file not found: {path.resolve()}")
+
+    config = taskset.config.model_copy(update={"data_path": str(path)})
+    tasks = list(type(taskset)(config).select(select))
+    if not tasks:
+        raise ValueError(f"GEPA dataset selection produced no tasks: {path}")
+    return tasks
 
 
 def split_tasks(

@@ -12,7 +12,7 @@ from typing import Literal
 import tomli_w
 
 from verifiers.v1.acp import ACPConfig, ACPHarness, ACPTurn
-from verifiers.v1.clients import ModelContext
+from verifiers.v1.clients import ModelContext, TrainClientConfig
 from verifiers.v1.configs.harness import HarnessConfig, PinnedVersion
 from verifiers.v1.harnesses.node import NODE_BIN_DIR, ensure_node
 from verifiers.v1.harnesses.utils.install import ensure_installed, remove_dir
@@ -237,6 +237,9 @@ class CodexHarness(ACPHarness[CodexHarnessConfig]):
             "model": ctx.model,
             "features": features,
         }
+        if isinstance(ctx.client, TrainClientConfig):
+            # Hosted search has no implementation in the renderer/generate backend.
+            config["web_search"] = "disabled"
         return {
             **self.config.resolved_env,
             "CODEX_CONFIG": json.dumps(config),

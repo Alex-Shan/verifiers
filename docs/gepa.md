@@ -31,10 +31,23 @@ Validate the config with `uv run vf-gepa @ config.toml --dry-run`, and run optim
 - `reflection_model` / `reflection_client` — teacher model and endpoint that propose new prompts (default: reuse `model` and `client`)
 - `select` — [task selection](tasksets.md#selecting-tasks) applied before splitting into train and validation sets (shuffling is off by default)
 - `num_train` / `num_val` — train tasks for reflection minibatches and validation tasks for scoring candidates on the Pareto frontier (defaults: `100` / `50`)
+- `train_tasks` / `val_tasks` — optional separate JSONL files. Set both to use every selected row from each file; the taskset config must expose `data_path`.
 - `max_total_rollouts` — total rollouts the run may spend (default: `500`)
 - `max_concurrent` / `-c` — max episodes in flight at once (default: `128`)
 
 Task selection runs before the train/val split: the first `num_train` selected tasks feed reflection minibatches, and the next `num_val` tasks score candidate prompts (`select.seed` controls task-selection shuffling, while `seed` controls the optimizer's own sampling). Because the validation slice guides prompt selection during optimization, evaluate the final prompt on a separate held-out slice of tasks.
+
+To read separate train and validation JSONL files through a taskset that has a `data_path` setting:
+
+```toml
+train_tasks = "data/train.jsonl"
+val_tasks = "data/validation.jsonl"
+
+[env.taskset]
+id = "hero_env"
+```
+
+In this mode, GEPA uses all rows selected from each file; `num_train` and `num_val` are ignored. `select` is applied independently to both files. The legacy top-level `shuffle = false` spelling is accepted as an alias for `select.shuffle`.
 
 ## Output
 
