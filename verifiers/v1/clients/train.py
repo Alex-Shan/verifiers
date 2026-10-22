@@ -15,8 +15,9 @@ from renderers.base import ToolCallParseStatus, is_multimodal
 
 from verifiers.v1.clients.base import build_async_openai
 from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
+from verifiers.v1.clients.responses import ResponsesRendererAdapter
 from verifiers.v1.configs.client import TrainClientConfig
-from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect
+from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, ResponsesDialect
 from verifiers.v1.dialects.chat import message_to_wire
 from verifiers.v1.errors import ProviderError, model_error
 from verifiers.v1.graph import PendingTurn
@@ -361,14 +362,10 @@ class TrainClient(Client):
     ) -> Response:
         # The renderer tokenizes the typed prompt for training (it needs per-token ids + logprobs
         # back), so it can't forward the raw request — it parses `body` via the dialect and renders
-        # it with a chat template. It leaves `Response.raw` unset; the interception server serializes
-        # its `Response` for the program instead of relaying provider bytes.
-        if not isinstance(dialect, ChatDialect):
-            # The renderer renders a chat template, so it's only validated for chat-completions
-            # input; other dialects' semantics (Responses reasoning items, Anthropic thinking) may
-            # not round-trip faithfully through chat-template tokenization. Refuse them explicitly.
+        # it with a chat template, then serializes the generated response in the native dialect.
+        if not isinstance(dialect, (ChatDialect, ResponsesDialect)):
             raise NotImplementedError(
-                f"The renderer client only supports the chat-completions dialect, got "
+                f"The renderer client only supports chat-completions and responses, got "
                 f"{type(dialect).__name__}. Use the proxy client for this dialect, or add "
                 f"renderer support for it."
             )
@@ -381,9 +378,16 @@ class TrainClient(Client):
             tools = request.tools
         from renderers.client import generate
 
-        wire_tools = [tool_to_wire(t) for t in tools] if tools else None
-        wire_messages = [message_to_wire(m) for m in prompt]
-        wire_tail = [message_to_wire(m) for m in turn.tail] if turn is not None else []
+        if isinstance(dialect, ResponsesDialect):
+            adapter = ResponsesRendererAdapter(body, tools)
+            wire_tools = adapter.tools
+            to_wire = adapter.message
+        else:
+            adapter = None
+            wire_tools = [tool_to_wire(t) for t in tools] if tools else None
+            to_wire = message_to_wire
+        wire_messages = [to_wire(m) for m in prompt]
+        wire_tail = [to_wire(m) for m in turn.tail] if turn is not None else []
         prompt_ids: list[int] | None = None
         prompt_attribution: RenderedTokens | None = None
         model = body["model"]
@@ -476,6 +480,8 @@ class TrainClient(Client):
         response = response_from_generate(
             result, model, bridged_turn, mm_token_type_id_map
         )
+        if adapter is not None:
+            return adapter.finish(response)
         # No provider response to relay (we generated), so serialize one for the program; the
         # interception server hands `Response.raw` back regardless of client.
         response.raw = serialize_completion(response, model)

@@ -2,13 +2,14 @@
 
 Request parsing walks the `input` items, folding each run of assistant-side items (reasoning /
 assistant message / function or custom tool call) into one typed assistant message; response
-parsing reads the `output` items. Relay-only: the eval client forwards the program's bytes to a
-`/responses` endpoint and this dialect parses a copy for the trace. Server-side statefulness
-(`previous_response_id`) is not emulated — the endpoint owns it.
+parsing reads the `output` items. Eval relays native provider bytes; training serializes renderer
+output into stateless Responses objects. Server-side statefulness (`previous_response_id`) is
+not emulated — the endpoint owns it.
 """
 
 import json
 import re
+import uuid
 from collections import deque
 
 from openai.types.responses.response_usage import (
@@ -326,6 +327,82 @@ def response_from_wire(response: OpenAIResponse) -> Response:
         finish_reason=finish,
         usage=usage,
     )
+
+
+def serialize_response(response: Response) -> dict:
+    """A generated response as native Responses items, without changing training tokens."""
+    if not response.id:
+        response.id = "resp_" + uuid.uuid4().hex
+    incomplete = response.finish_reason == "length"
+    status = "incomplete" if incomplete else "completed"
+    output: list[dict] = []
+    message = response.message
+    if message.reasoning_content:
+        output.append(
+            {
+                "type": "reasoning",
+                "id": "rs_" + uuid.uuid4().hex,
+                "summary": [
+                    {"type": "summary_text", "text": message.reasoning_content}
+                ],
+            }
+        )
+    if message.content is not None or not (message.tool_calls or output):
+        output.append(
+            {
+                "type": "message",
+                "id": "msg_" + uuid.uuid4().hex,
+                "role": "assistant",
+                "phase": "commentary" if message.tool_calls else "final_answer",
+                "status": status,
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": message.content or "",
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ],
+            }
+        )
+    for call in message.tool_calls or []:
+        custom = call.type == "custom"
+        output.append(
+            {
+                "type": "custom_tool_call" if custom else "function_call",
+                "id": ("ctc_" if custom else "fc_") + uuid.uuid4().hex,
+                "call_id": call.id,
+                "name": call.name,
+                **({"namespace": call.namespace} if call.namespace else {}),
+                "input" if custom else "arguments": call.arguments,
+                "status": status,
+            }
+        )
+    usage = None
+    if response.usage is not None:
+        usage = {
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens,
+            "input_tokens_details": {
+                "cached_tokens": response.usage.cached_input_tokens or 0,
+                "cache_write_tokens": 0,
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": response.usage.reasoning_tokens or 0
+            },
+        }
+    return {
+        **_KEEPALIVE_RESPONSE,
+        "id": response.id,
+        "created_at": response.created,
+        "model": response.model,
+        "status": status,
+        "output": output,
+        "usage": usage,
+        "error": None,
+        "incomplete_details": {"reason": "max_output_tokens"} if incomplete else None,
+    }
 
 
 class ResponsesStreamParser(StreamParser):
@@ -706,39 +783,126 @@ class ResponsesDialect(Dialect[OpenAIResponse]):
         return f"event: response.failed\ndata: {json.dumps(payload)}\n\n".encode()
 
     def stream_events(self, raw: dict) -> list[bytes]:
-        item = raw["output"][0]
-        part = item["content"][0]
-        common = {"output_index": 0, "item_id": item["id"], "content_index": 0}
-        logprobs = part.get("logprobs") or []
         head = {
             **raw,
             "status": "in_progress",
             "output": [],
             "completed_at": None,
         }
-        events = [
-            ("response.created", {"response": head}),
-            (
-                "response.output_item.added",
-                {"output_index": 0, "item": {**item, "content": []}},
-            ),
-            (
-                "response.content_part.added",
-                {**common, "part": {**part, "text": ""}},
-            ),
-            # `logprobs` is required on both text events; carry the part's own.
-            (
-                "response.output_text.delta",
-                {**common, "delta": part["text"], "logprobs": logprobs},
-            ),
-            (
-                "response.output_text.done",
-                {**common, "text": part["text"], "logprobs": logprobs},
-            ),
-            ("response.content_part.done", {**common, "part": part}),
-            ("response.output_item.done", {"output_index": 0, "item": item}),
-            ("response.completed", {"response": raw}),
-        ]
+        events = [("response.created", {"response": head})]
+        for index, item in enumerate(raw.get("output") or []):
+            kind = item["type"]
+            common = {"output_index": index, "item_id": item["id"]}
+            initial = {**item}
+            if "status" in initial:
+                initial["status"] = "in_progress"
+            field = {
+                "message": "content",
+                "reasoning": "summary",
+                "function_call": "arguments",
+                "custom_tool_call": "input",
+            }.get(kind)
+            if field:
+                initial[field] = [] if field in ("content", "summary") else ""
+            if kind == "reasoning" and "content" in initial:
+                initial["content"] = []
+            events.append(
+                ("response.output_item.added", {"output_index": index, "item": initial})
+            )
+            if kind in ("function_call", "custom_tool_call"):
+                event = (
+                    "function_call_arguments"
+                    if kind == "function_call"
+                    else "custom_tool_call_input"
+                )
+                events.extend(
+                    [
+                        (f"response.{event}.delta", {**common, "delta": item[field]}),
+                        (
+                            f"response.{event}.done",
+                            {
+                                **common,
+                                field: item[field],
+                                **(
+                                    {"name": item["name"]}
+                                    if kind == "function_call"
+                                    else {}
+                                ),
+                            },
+                        ),
+                    ]
+                )
+            elif kind == "message":
+                for content_index, part in enumerate(item.get("content") or []):
+                    location = {**common, "content_index": content_index}
+                    refusal = part["type"] == "refusal"
+                    text_field = "refusal" if refusal else "text"
+                    text_event = "refusal" if refusal else "output_text"
+                    logprobs = (
+                        {} if refusal else {"logprobs": part.get("logprobs") or []}
+                    )
+                    events.extend(
+                        [
+                            (
+                                "response.content_part.added",
+                                {**location, "part": {**part, text_field: ""}},
+                            ),
+                            (
+                                f"response.{text_event}.delta",
+                                {**location, "delta": part[text_field], **logprobs},
+                            ),
+                            (
+                                f"response.{text_event}.done",
+                                {**location, text_field: part[text_field], **logprobs},
+                            ),
+                            ("response.content_part.done", {**location, "part": part}),
+                        ]
+                    )
+            elif kind == "reasoning":
+                for summary_index, part in enumerate(item.get("summary") or []):
+                    location = {**common, "summary_index": summary_index}
+                    events.extend(
+                        [
+                            (
+                                "response.reasoning_summary_part.added",
+                                {**location, "part": {**part, "text": ""}},
+                            ),
+                            (
+                                "response.reasoning_summary_text.delta",
+                                {**location, "delta": part["text"]},
+                            ),
+                            (
+                                "response.reasoning_summary_text.done",
+                                {**location, "text": part["text"]},
+                            ),
+                            (
+                                "response.reasoning_summary_part.done",
+                                {**location, "part": part},
+                            ),
+                        ]
+                    )
+                for content_index, part in enumerate(item.get("content") or []):
+                    location = {**common, "content_index": content_index}
+                    events.extend(
+                        [
+                            (
+                                "response.reasoning_text.delta",
+                                {**location, "delta": part["text"]},
+                            ),
+                            (
+                                "response.reasoning_text.done",
+                                {**location, "text": part["text"]},
+                            ),
+                        ]
+                    )
+            events.append(
+                ("response.output_item.done", {"output_index": index, "item": item})
+            )
+        terminal = {
+            "incomplete": "response.incomplete",
+            "failed": "response.failed",
+        }.get(raw.get("status"), "response.completed")
+        events.append((terminal, {"response": raw}))
         return [
             *(
                 f"data: {json.dumps({'type': kind, 'sequence_number': i, **data})}\n\n".encode()

@@ -13,12 +13,11 @@ from pathlib import Path
 from pydantic import AliasChoices, Field, SerializeAsAny, model_validator
 from pydantic_config import BaseConfig
 
-from verifiers.v1.clients import EvalClientConfig
 from verifiers.v1.configs.cli.env import narrowed_env_annotation, resolve_env_field
 from verifiers.v1.configs.cli.eval import RunConfig, default_run_name
-from verifiers.v1.configs.env import EnvConfig
+from verifiers.v1.configs.client import EvalClientConfig
+from verifiers.v1.configs.env import EnvConfig, SingleAgentEnvConfig
 from verifiers.v1.configs.select import SelectCLIConfig
-from verifiers.v1.envs.single_agent import SingleAgentEnvConfig
 from verifiers.v1.types import SamplingConfig
 
 
@@ -53,6 +52,14 @@ class GEPAConfig(BaseConfig):
     select: SelectCLIConfig = SelectCLIConfig()
     """Which of the taskset's tasks GEPA splits into train/val, under `--select.*`
     (`-n` sets `select.limit`, `-s` sets `select.shuffle`)."""
+    train_tasks: Path | None = None
+    """Optional JSONL file used as the full training set. Set together with
+    `val_tasks`; the taskset config must expose a `data_path` field."""
+    val_tasks: Path | None = None
+    """Optional JSONL file used as the full validation set. Set together with
+    `train_tasks`; the taskset config must expose a `data_path` field."""
+    shuffle: bool | None = Field(None, exclude=True)
+    """Legacy top-level alias for `select.shuffle`."""
     num_train: int = Field(100, ge=1)
     """Tasks reserved for reflection minibatches (GEPA never scores the full trainset at once)."""
     num_val: int = Field(50, ge=1)
@@ -62,12 +69,35 @@ class GEPAConfig(BaseConfig):
     split comes from `select` (`-s` shuffles it under `select.seed`), so this doesn't
     change it."""
 
-    max_total_rollouts: int = Field(500)
-    """Total rollouts GEPA may spend across the whole optimization run."""
+    max_total_rollouts: int | None = Field(None, ge=1)
+    """Rollout budget. Defaults to 500 when no other stopping condition is selected.
+    In GR-GEPA, each training task uses `group_size` rollouts; validation uses one."""
+    max_iterations: int | None = Field(None, ge=1)
+    """Stop after this many GEPA optimization iterations."""
+    max_iterations_without_improvement: int | None = Field(None, ge=1)
+    """Stop after this many iterations without a better validation score."""
     reflection_minibatch_size: int = 3
     """Train tasks sampled per reflection step."""
+    gr_gepa: bool = False
+    """Compare repeated rollouts of each training task under the same candidate prompt."""
+    group_size: int = Field(4, ge=2)
+    """Rollouts per training task when GR-GEPA is enabled. Validation always uses one."""
+    group_alpha: float = Field(0.9, ge=0, le=1)
+    """Weight of task success; the remainder rewards brevity among successful rollouts."""
+    group_success_threshold: float = Field(0.9, ge=0, lt=1)
+    """A GR-GEPA rollout succeeds when its reward reaches this threshold."""
     reflection_columns: list[str] = Field(default_factory=list)
     """Extra per-trace fields (from `trace.info`, else `task`) to surface to the teacher LM."""
+    constraint: str = (
+        "When improving the prompt, do NOT copy specific examples,keywords, usernames, "
+        "or verbatim phrases from these examples. Generalize to rules that apply broadly."
+        "Improve task reward while keeping the prompt concise."
+    )
+    """Instruction included in each reflective example for the teacher LM."""
+    use_wandb: bool = False
+    """Whether GEPA should report the optimization run to Weights & Biases."""
+    wandb_project: str = "GEPA"
+    """Weights & Biases project name for the optimization run."""
     initial_prompt: str | None = None
     """Seed system prompt. None = the first loaded task's `Task.system_prompt`, if any task
     sets one (see `resolve_gepa_seed_prompt`)."""
@@ -87,9 +117,41 @@ class GEPAConfig(BaseConfig):
     dry_run: bool = Field(False, exclude=True)
     """Resolve + validate the config and dump it, then exit. Excluded from the
     saved config so re-running `@ configs/gepa.json` runs for real."""
+    clean: bool = Field(False, exclude=True)
+    """Delete the run directory (`output_dir / run.dir`) before running, overwriting a
+    previous run's results. Excluded from the saved config."""
 
     @model_validator(mode="after")
-    def auto_setup_run_name(self):
+    def validate_stop_and_setup_run_name(self):
+        if self.shuffle is not None:
+            self.select = self.select.model_copy(update={"shuffle": self.shuffle})
+        if (self.train_tasks is None) != (self.val_tasks is None):
+            raise ValueError("train_tasks and val_tasks must be set together")
+        if self.train_tasks is not None:
+            taskset_fields = type(self.env.taskset).model_fields
+            if "data_path" not in taskset_fields:
+                raise ValueError(
+                    "train_tasks/val_tasks require a taskset config with a `data_path` field"
+                )
+
+        stop_values = (
+            self.max_total_rollouts,
+            self.max_iterations,
+            self.max_iterations_without_improvement,
+        )
+        if all(value is None for value in stop_values):
+            self.max_total_rollouts = 500
+        elif sum(value is not None for value in stop_values) != 1:
+            raise ValueError(
+                "set exactly one of max_total_rollouts, max_iterations, "
+                "max_iterations_without_improvement"
+            )
+        if (
+            self.gr_gepa
+            and self.max_total_rollouts is not None
+            and self.max_total_rollouts < self.group_size
+        ):
+            raise ValueError("max_total_rollouts must allow at least one GR-GEPA group")
         if self.run.name is None:
             self.run.name = default_run_name(self.env, self.model)
         if self.run.dir is None:
