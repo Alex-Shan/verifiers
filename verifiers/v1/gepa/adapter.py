@@ -144,12 +144,12 @@ class GEPAAdapter:
                 ):
                     rollouts.append(
                         {
-                            "success": _is_success(
-                                episode, self.group_success_threshold
-                            ),
+                            # "success": _is_success(
+                            #     episode, self.group_success_threshold
+                            # ),
                             "reward": _episode_score(episode),
                             "num_output_tokens": episode.num_output_tokens,
-                            "relative_brevity": brevity,
+                            # "relative_brevity": brevity,
                             "score": score,
                             "traces": self._episode_records(episode),
                             "error": str(episode.last_error)
