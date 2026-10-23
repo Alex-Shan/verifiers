@@ -151,7 +151,6 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 semaphore=semaphore,
                 on_complete=on_complete,
                 reflection_columns=config.reflection_columns,
-                constraint=config.constraint,
                 reflective_dataset_path=reflective_dataset_path,
                 gr_gepa=config.gr_gepa,
                 group_size=config.group_size,

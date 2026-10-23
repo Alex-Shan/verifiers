@@ -88,12 +88,6 @@ class GEPAConfig(BaseConfig):
     """A GR-GEPA rollout succeeds when its reward reaches this threshold."""
     reflection_columns: list[str] = Field(default_factory=list)
     """Extra per-trace fields (from `trace.info`, else `task`) to surface to the teacher LM."""
-    constraint: str = (
-        "When improving the prompt, do NOT copy specific examples,keywords, usernames, "
-        "or verbatim phrases from these examples. Generalize to rules that apply broadly."
-        "Improve task reward while keeping the prompt concise."
-    )
-    """Instruction included in each reflective example for the teacher LM."""
     use_wandb: bool = False
     """Whether GEPA should report the optimization run to Weights & Biases."""
     wandb_project: str = "GEPA"
