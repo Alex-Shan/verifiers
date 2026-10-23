@@ -51,7 +51,6 @@ class GEPAAdapter:
     """Part of GEPA's adapter protocol — its proposer reads this attribute on every reflection
     step. None = use GEPA's default reflection-LM proposer (the AttributeError from leaving it
     undeclared silently disables all mutation proposals)."""
-    constraint: str = ""
     reflective_dataset_path: Path | None = None
     gr_gepa: bool = False
     group_size: int = 4
@@ -166,7 +165,6 @@ class GEPAAdapter:
                         "parent_prompt": candidate.get("system_prompt", ""),
                         "query": to_jsonable_python(trajectory[0].task.data.prompt),
                         "rollouts": rollouts,
-                        "constraint": self.constraint,
                     }
                 )
             else:
@@ -187,7 +185,6 @@ class GEPAAdapter:
                 ],
                 "reward": trace.reward,
                 "agent": trace.agent.name,
-                "constraint": self.constraint,
             }
             if trace.has_error:
                 record["error"] = str(trace.last_error)
