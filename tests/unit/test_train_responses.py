@@ -2,6 +2,7 @@
 
 import json
 
+import numpy as np
 import pytest
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses import ResponseStreamEvent
@@ -74,7 +75,7 @@ def test_namespaced_and_custom_tools_round_trip_without_changing_tokens():
     assert (custom.type, custom.arguments) == ("custom", patch)
     assert function.id != custom.id
     assert response.tokens is tokens
-    assert response.tokens.completion_logprobs == [-0.1, -0.2]
+    np.testing.assert_allclose(response.tokens.completion_logprobs, [-0.1, -0.2])
     replay = ResponsesDialect().parse_request({"input": response.raw["output"]})
     assert message_hash(replay.messages[0]) == message_hash(response.message)
     wire = adapter.message(replay.messages[0])
