@@ -7,7 +7,8 @@ name = "verifiers"
 authors = [
     {name = "William Brown", email = "williambrown97@gmail.com"},
 ]
-dynamic = ["version"]  # derived from git tags via hatch-vcs
+# dynamic = ["version"]
+version = "0.4.2026"
 description = "Verifiers: Environments for LLM Reinforcement Learning"
 readme = "README.md"
 license = "MIT"
