@@ -715,7 +715,7 @@ class Trace(BaseModel, Generic[DataT, StateT, AgentConfigT]):
     @property
     def last_reply(self) -> str:
         """The root agent's response, falling back to the last assistant message."""
-        if self.root_reply is not None:
+        if self.root_reply:
             return self.root_reply.strip()
         msgs = self.assistant_messages
         return (msgs[-1].content or "").strip() if msgs else ""

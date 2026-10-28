@@ -170,6 +170,7 @@ class DockerConfig(NetworkPolicyConfig):
     @classmethod
     def validate_host_proxy(cls, value: str | None) -> str | None:
         if value is not None:
+            from urllib.parse import urlsplit
             parsed = urlsplit(value)
             if (
                 parsed.scheme not in ("http", "https", "socks5", "socks5h")
