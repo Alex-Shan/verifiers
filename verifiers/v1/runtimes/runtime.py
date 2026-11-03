@@ -162,29 +162,58 @@ class Runtime:
         path = f"{directory}/{digest}.py"
         if path not in self.backend.cache.uv_interpreters:
             async with self.backend.cache.uv_locks.setdefault(path, asyncio.Lock()):
-                if self.user is not None and not self.backend.cache.curl_ready:
-                    # Only root can install a downloader for the user's uv bootstrap.
-                    curl = await self.with_user(None).run(
-                        ["sh", "-c", _INSTALL_CURL], {}
-                    )
-                    self.backend.cache.curl_ready = curl.exit_code == 0
                 if path not in self.backend.cache.uv_interpreters:
                     tmp = f"{path}.{uuid.uuid4().hex}.tmp"
                     await self.write(tmp, data)
+                    offline = (
+                        self.process_env(env or {})
+                        .get("VF_UV_SETUP_OFFLINE", "false")
+                        .lower()
+                        == "true"
+                    )
+                    if (
+                        not offline
+                        and self.user is not None
+                        and not self.backend.cache.curl_ready
+                    ):
+                        # Only root can install a downloader for the user's uv bootstrap.
+                        curl = await self.with_user(None).run(
+                            ["sh", "-c", _INSTALL_CURL], {}
+                        )
+                        self.backend.cache.curl_ready = curl.exit_code == 0
+                    ensure_uv = (
+                        "command -v uv >/dev/null && uv sync --help | grep -q -- --script && "
+                        "uv python find --help | grep -q -- --script"
+                        if offline
+                        else _ENSURE_UV
+                    )
+                    lock_path = shlex.quote(f"{path}.lock")
+                    lock_check = (
+                        f'test -f {lock_path} || {{ echo "Missing prewarmed script lock; rebuild image: {path}" >&2; exit 1; }}; '
+                        if offline
+                        else ""
+                    )
+                    sync_flags = (
+                        "--offline --locked"
+                        if offline
+                        else f"$(test ! -f {lock_path} || printf %s --locked)"
+                    )
                     command = (
-                        f"mv -f {shlex.quote(tmp)} {shlex.quote(path)} "
-                        f"&& {{ {_ENSURE_UV}; }} "
-                        f"&& uv sync --script {shlex.quote(path)} -q --no-config "
+                        lock_check + f"mv -f {shlex.quote(tmp)} {shlex.quote(path)} "
+                        f"&& {{ {ensure_uv}; }} "
+                        f"&& uv sync --script {shlex.quote(path)} -q --no-config {sync_flags} "
                         f"&& uv python find --script {shlex.quote(path)} --no-config"
                     )
-                    # Bootstrap dependencies before task networking is restricted;
-                    # keep task offline settings on the returned program's processes.
-                    result = await self.run(
-                        ["sh", "-c", command], {**(env or {}), "UV_OFFLINE": "false"}
-                    )
+                    setup_env = {
+                        **(env or {}),
+                        "UV_OFFLINE": "true" if offline else "false",
+                    }
+                    if offline:
+                        setup_env["UV_PYTHON_DOWNLOADS"] = "never"
+                    result = await self.run(["sh", "-c", command], setup_env)
                     if result.exit_code != 0:
                         raise RuntimeError(
-                            "failed to prepare uv script: "
+                            f"failed to prepare uv script {path}; rebuild the image if its prewarm cache is incomplete: "
                             f"{result.stderr.strip()[-2000:]}"
                         )
                     self.backend.cache.uv_interpreters[path] = (

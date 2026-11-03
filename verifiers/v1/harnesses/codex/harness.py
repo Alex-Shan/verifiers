@@ -187,7 +187,9 @@ class CodexHarness(ACPHarness[CodexHarnessConfig]):
     ) -> dict[str, str]:
         home = self.trace_home(trace)
         await self.install_skills(runtime, f"{home}/skills")
-        mcp_config = "features={mcp_2026_07_28=true}\n" + (
+        # The ACP adapter starts app-server before applying CODEX_CONFIG.
+        # Disable plugin discovery in the startup config to prevent background sync.
+        mcp_config = "features={mcp_2026_07_28=true,apps=false,plugins=false}\n" + (
             "mcp_servers={"
             + ",".join(
                 f"{json.dumps(name, ensure_ascii=False)}="

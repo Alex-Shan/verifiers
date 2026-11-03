@@ -158,6 +158,14 @@ class PrimeAgentHarness(ACPHarness[PrimeAgentHarnessConfig]):
             install=INSTALL,
             env={
                 **self.config.resolved_env,
+                **(
+                    {"UV_OFFLINE": "true", "UV_PYTHON_DOWNLOADS": "never"}
+                    if self.config.resolved_env.get(
+                        "VF_UV_SETUP_OFFLINE", "false"
+                    ).lower()
+                    == "true"
+                    else {}
+                ),
                 "VF_PRIME_AGENT_DIR": PRIME_AGENT_DIR,
                 "VF_PRIME_AGENT_GITHUB_RELEASE_URL": GITHUB_RELEASE_URL,
                 "PRIME_AGENT_COMMIT": self.config.commit,
