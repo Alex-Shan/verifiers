@@ -55,6 +55,7 @@ class GEPAAdapter:
     gr_gepa: bool = False
     group_size: int = 4
     group_alpha: float = 0.5
+    group_time_weight: float = 0.5
     group_success_threshold: float = 1.0
 
     def evaluate(
@@ -87,7 +88,10 @@ class GEPAAdapter:
                 scores.append(
                     sum(
                         _group_scores(
-                            group, self.group_alpha, self.group_success_threshold
+                            group,
+                            self.group_alpha,
+                            self.group_success_threshold,
+                            self.group_time_weight,
                         )
                     )
                     / n
@@ -133,22 +137,19 @@ class GEPAAdapter:
         records: list[dict[str, Any]] = []
         for trajectory in trajectories:
             if isinstance(trajectory, list):
-                brevities = _group_brevities(trajectory, self.group_success_threshold)
                 scores = _group_scores(
-                    trajectory, self.group_alpha, self.group_success_threshold
+                    trajectory,
+                    self.group_alpha,
+                    self.group_success_threshold,
+                    self.group_time_weight,
                 )
                 rollouts = []
-                for episode, brevity, score in zip(
-                    trajectory, brevities, scores, strict=True
-                ):
+                for episode, score in zip(trajectory, scores, strict=True):
                     rollouts.append(
                         {
-                            # "success": _is_success(
-                            #     episode, self.group_success_threshold
-                            # ),
                             "reward": _episode_score(episode),
-                            "num_output_tokens": episode.num_output_tokens,
-                            # "relative_brevity": brevity,
+                            "num_total_tokens": episode.num_total_tokens,
+                            "timing": _episode_timing(episode),
                             "score": score,
                             "traces": self._episode_records(episode),
                             "error": str(episode.last_error)
@@ -159,8 +160,12 @@ class GEPAAdapter:
                 records.append(
                     {
                         "comparison_guidance": (
-                            "Compare rollouts of this same task. Diagnose recurring errors and separate task difficulty from prompt strategy."
-                            "`reward` is Original task score,`score` is comprehensive scores of success and brevity; propose a generalizable prompt revision."
+                            "Compare rollouts of this same task. Diagnose recurring errors and "
+                            "separate task difficulty from prompt strategy. `reward` is the "
+                            "original task score. `score` combines success, relative total-token "
+                            "brevity, and relative agent time. `timing.agent` records total "
+                            "seconds, with `model` and `harness` breakdowns; propose a "
+                            "generalizable prompt revision."
                         ),
                         "parent_prompt": candidate.get("system_prompt", ""),
                         "query": to_jsonable_python(trajectory[0].task.data.prompt),
@@ -185,6 +190,7 @@ class GEPAAdapter:
                 ],
                 "reward": trace.reward,
                 "agent": trace.agent.name,
+                "timing": _trace_timing(trace),
             }
             if trace.has_error:
                 record["error"] = str(trace.last_error)
@@ -215,15 +221,55 @@ def _is_success(episode: Episode, threshold: float) -> bool:
     return episode.ok and _episode_score(episode) >= threshold
 
 
+def _trace_timing(trace: Any) -> dict[str, dict[str, float]]:
+    agent = trace.timing.agent
+    return {
+        "agent": {
+            "duration": agent.duration,
+            "model": agent.model.duration,
+            "harness": agent.harness.duration,
+        }
+    }
+
+
+def _episode_timing(episode: Episode) -> dict[str, dict[str, float]]:
+    """Sum each trace's agent timing to represent an episode's total compute cost."""
+    return {
+        "agent": {
+            "duration": sum(trace.timing.agent.duration for trace in episode.traces),
+            "model": sum(trace.timing.agent.model.duration for trace in episode.traces),
+            "harness": sum(
+                trace.timing.agent.harness.duration for trace in episode.traces
+            ),
+        }
+    }
+
+
 def _group_brevities(episodes: list[Episode], threshold: float) -> list[float]:
-    """Compare output lengths only among successful episodes of the same task."""
+    """Compare total-token lengths only among successful episodes of the same task."""
     successes = [episode for episode in episodes if _is_success(episode, threshold)]
     if not successes:
         return [0.0] * len(episodes)
-    lengths = [episode.num_output_tokens for episode in successes]
+    lengths = [episode.num_total_tokens for episode in successes]
     longest, shortest = max(lengths), min(lengths)
     return [
-        (longest - episode.num_output_tokens) / (longest - shortest + _EPSILON)
+        (longest - episode.num_total_tokens) / (longest - shortest + _EPSILON)
+        if _is_success(episode, threshold)
+        else 0.0
+        for episode in episodes
+    ]
+
+
+def _group_time_efficiencies(episodes: list[Episode], threshold: float) -> list[float]:
+    """Compare total agent time only among successful episodes of the same task."""
+    successes = [episode for episode in episodes if _is_success(episode, threshold)]
+    if not successes:
+        return [0.0] * len(episodes)
+    times = [_episode_timing(episode)["agent"]["duration"] for episode in successes]
+    longest, shortest = max(times), min(times)
+    return [
+        (longest - _episode_timing(episode)["agent"]["duration"])
+        / (longest - shortest + _EPSILON)
         if _is_success(episode, threshold)
         else 0.0
         for episode in episodes
@@ -231,12 +277,20 @@ def _group_brevities(episodes: list[Episode], threshold: float) -> list[float]:
 
 
 def _group_scores(
-    episodes: list[Episode], alpha: float, threshold: float
+    episodes: list[Episode],
+    alpha: float,
+    threshold: float,
+    time_weight: float = 0.5,
 ) -> list[float]:
-    """Apply the success/relative-brevity tradeoff to each rollout in a group."""
+    """Score success, relative total-token brevity, and relative agent time."""
+    brevities = _group_brevities(episodes, threshold)
+    time_efficiencies = _group_time_efficiencies(episodes, threshold)
     return [
-        alpha + (1 - alpha) * brevity if _is_success(episode, threshold) else 0.0
-        for episode, brevity in zip(
-            episodes, _group_brevities(episodes, threshold), strict=True
+        alpha
+        + (1 - alpha) * ((1 - time_weight) * brevity + time_weight * time_efficiency)
+        if _is_success(episode, threshold)
+        else 0.0
+        for episode, brevity, time_efficiency in zip(
+            episodes, brevities, time_efficiencies, strict=True
         )
     ]

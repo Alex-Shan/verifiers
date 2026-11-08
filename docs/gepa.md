@@ -34,6 +34,7 @@ Validate the config with `uv run vf-gepa @ config.toml --dry-run`, and run optim
 - `train_tasks` / `val_tasks` — optional separate JSONL files. Set both to use every selected row from each file; the taskset config must expose `data_path`.
 - `max_total_rollouts` — total rollouts the run may spend (default: `500`)
 - `max_concurrent` / `-c` — max episodes in flight at once (default: `128`)
+- `gr_gepa`, `group_size`, `group_alpha`, `group_time_weight`, and `group_success_threshold` — compare repeated training rollouts for the same task. For successful rollouts, the score combines relative total-token brevity and relative total agent time; `group_time_weight` defaults to `0.5`. Validation still uses one rollout per task and scores its original reward.
 
 Task selection runs before the train/val split: the first `num_train` selected tasks feed reflection minibatches, and the next `num_val` tasks score candidate prompts (`select.seed` controls task-selection shuffling, while `seed` controls the optimizer's own sampling). Because the validation slice guides prompt selection during optimization, evaluate the final prompt on a separate held-out slice of tasks.
 

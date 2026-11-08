@@ -84,7 +84,10 @@ class GEPAConfig(BaseConfig):
     group_size: int = Field(4, ge=2)
     """Rollouts per training task when GR-GEPA is enabled. Validation always uses one."""
     group_alpha: float = Field(0.9, ge=0, le=1)
-    """Weight of task success; the remainder rewards brevity among successful rollouts."""
+    """Weight of task success; the remainder rewards efficiency among successful rollouts."""
+    group_time_weight: float = Field(0.5, ge=0, le=1)
+    """Share of the non-success score assigned to relative agent-time efficiency;
+    the remainder rewards total-token brevity."""
     group_success_threshold: float = Field(0.9, ge=0, lt=1)
     """A GR-GEPA rollout succeeds when its reward reaches this threshold."""
     reflection_columns: list[str] = Field(default_factory=list)

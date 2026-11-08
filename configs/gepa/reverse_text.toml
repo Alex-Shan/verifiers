@@ -13,6 +13,7 @@ max_concurrent = 128
 gr_gepa = true
 group_size = 4
 group_alpha = 0.8
+group_time_weight = 0.5
 group_success_threshold = 0.7
 seed = 42
 use_wandb = false

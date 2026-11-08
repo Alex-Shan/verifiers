@@ -155,6 +155,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 gr_gepa=config.gr_gepa,
                 group_size=config.group_size,
                 group_alpha=config.group_alpha,
+                group_time_weight=config.group_time_weight,
                 group_success_threshold=config.group_success_threshold,
             )
             optimize_kwargs: dict = {
