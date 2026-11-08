@@ -477,6 +477,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mcp-config", default="")
     parser.add_argument("--tool-interception-url", default="")
     parser.add_argument("--bash", action="store_true")
+    parser.add_argument("--bash-tool-definition", type=json.loads)
     parser.add_argument("--compaction", action="store_true")
     parser.add_argument("--summarize-at-tokens", type=int)
     parser.add_argument("--edit", action="store_true")
@@ -507,7 +508,7 @@ async def main() -> None:
         else None
     )
     config = json.loads(args.mcp_config or "{}")
-    tools = [BASH_TOOL] if args.bash else []
+    tools = [args.bash_tool_definition or BASH_TOOL] if args.bash else []
     reserved = {"bash"} if args.bash else set()
     if args.edit:
         tools.append(EDIT_TOOL)
