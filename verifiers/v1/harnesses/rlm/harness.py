@@ -1,7 +1,6 @@
 """RLM over ACP, with MCP tools exposed as pre-imported IPython skills."""
 
 import hashlib
-import logging
 import secrets
 import shlex
 from typing import Any, Literal
@@ -19,12 +18,14 @@ from pydantic_config import BaseConfig
 from verifiers.v1.acp import ACPConfig, ACPHarness, ACPTurn, JsonObject
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.harness import HarnessConfig
+from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.harnesses.utils.install import ensure_installed, remove_dir
 from verifiers.v1.runtimes import Runtime
 from verifiers.v1.task import TaskData
 from verifiers.v1.trace import Trace
+from verifiers.v1.utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 BuiltinSkill = Literal["bash", "edit", "fetch", "search"]
 BuiltinTool = Literal["bash", "edit", "fetch", "ipython"]
@@ -49,6 +50,7 @@ _TRUNCATION_STOPS = {
     "max_total_turns": "max_turns",
     "token_budget": "max_output_tokens",
     "compaction_failed": "compaction_failed",
+    "format_violation": "format_violation",
 }
 
 
@@ -63,13 +65,13 @@ class CompactionConfig(BaseConfig):
     nano-rlm's default."""
     max_attempts: PositiveInt | None = None
     """Summary-generation attempts within one compaction cycle; `None` =
-    nano-rlm's default (5)."""
+    nano-rlm's default (5). Set 1 for training without summary resampling."""
 
 
 class RLMHarnessConfig(HarnessConfig):
     dialect: Literal["chat_completions"] = "chat_completions"
     version: str = Field(
-        default="4cd7f399f5ba79c350d693af63144e2609062235", min_length=1
+        default="ae1cc01f8293987d18b09286b34d93c0dfbf8dac", min_length=1
     )
     """Git ref (branch, tag, or commit) of nano-rlm to install. Must know every
     field this harness puts on the wire, i.e. be at least the default ref."""
@@ -85,11 +87,11 @@ class RLMHarnessConfig(HarnessConfig):
     compaction: CompactionConfig | bool | None = None
     """Context compaction: a `[compaction]` section (or `true`) enables it with the
     given settings, `false` disables it (an overflowing session then fails), and
-    unset defers to nano-rlm's default (on, automatic thresholds, bounded by its
-    default 1M tree-token budget)."""
+    unset defers to nano-rlm's default (on, automatic thresholds, bounded by
+    `max_total_tokens`)."""
     max_concurrent_subagents: PositiveInt | None = None
-    """Sub-agents running at once per session tree; `None` = nano-rlm's default (4),
-    raised to an explicit `max_depth` when needed to keep the policy valid."""
+    """Concurrent model calls across the session tree, including the root and compaction;
+    `None` = nano-rlm's default (4), independent of recursion depth."""
     max_subagent_calls: PositiveInt | None = None
     """Tree-total recursive call cap; `None` uses nano-rlm's default (uncapped)."""
     delegation_prompt: bool | None = None
@@ -103,6 +105,10 @@ class RLMHarnessConfig(HarnessConfig):
     """Allow unrestricted Git history queries (e.g. `git log --all`); `None` uses
     nano-rlm's default (false). Ordinary Git commands remain allowed either way;
     this is not filesystem or process isolation."""
+    network_guidance: bool | None = None
+    """Keep nano-rlm's prompt guidance that assumes outbound network access (installing
+    extra kernel packages, the online-solutions warning). `None` turns it off when the
+    box allows no network destinations and otherwise uses nano-rlm's default (on)."""
     max_total_turns: PositiveInt | None = None
     """Tree-total turn budget (one turn = one work-loop model call, any engine); every
     engine stops before its next call once spent. `None` = uncapped."""
@@ -128,15 +134,6 @@ class RLMHarnessConfig(HarnessConfig):
             raise ValueError(
                 "the rlm harness does not support `disabled_tools`; select the tool "
                 "set with `builtin_tools` and skills with `builtin_skills` instead."
-            )
-        if (
-            self.max_depth is not None
-            and self.max_concurrent_subagents is not None
-            and self.max_concurrent_subagents < self.max_depth
-        ):
-            raise ValueError(
-                "`max_concurrent_subagents` must be at least `max_depth` "
-                "(nano-rlm rejects the policy otherwise)."
             )
         return self
 
@@ -174,7 +171,7 @@ class RLMHarness(ACPHarness[RLMHarnessConfig]):
             f"RLM_CHECKOUT_PATH={checkout} bash {checkout}/install.sh && "
             f"touch {ready})"
         )
-        logger.info("rlm: ensuring rlm is installed (version=%s)", self.config.version)
+        logger.debug("Ensuring rlm %s is installed", self.config.version)
         env = self.config.resolved_env.copy()
         extra_uv_args = env.get("RLM_EXTRA_UV_ARGS", "")
         env["RLM_EXTRA_UV_ARGS"] = f"{extra_uv_args} --with mcp~=1.28".strip()
@@ -198,16 +195,14 @@ class RLMHarness(ACPHarness[RLMHarnessConfig]):
         system_prompt: str | None,
     ) -> JsonObject:
         compaction = self.config.compaction
-        max_concurrent_subagents = self.config.max_concurrent_subagents
-        if max_concurrent_subagents is None and self.config.max_depth is not None:
-            max_concurrent_subagents = max(4, self.config.max_depth)
         policy_knobs: dict[str, Any] = {
             "max_depth": self.config.max_depth,
-            "max_concurrent_subagents": max_concurrent_subagents,
+            "max_concurrent_subagents": self.config.max_concurrent_subagents,
             "max_subagent_calls": self.config.max_subagent_calls,
             "delegation_prompt": self.config.delegation_prompt,
             "exec_timeout": self.config.exec_timeout,
             "allow_git": self.config.allow_git,
+            "network_guidance": self._network_guidance(runtime),
             "max_total_turns": self.config.max_total_turns,
             "max_total_tokens": self.config.max_total_tokens or None,
             "max_tool_output_bytes": self.config.max_tool_output_bytes,
@@ -252,9 +247,24 @@ class RLMHarness(ACPHarness[RLMHarnessConfig]):
             "kernel_env": dict(runtime.env),
             "search_api_key": self.config.resolved_env.get("SERPER_API_KEY"),
         }
+        if (
+            "search" in self.config.builtin_skills
+            and isinstance(runtime.config, NetworkPolicyConfig)
+            and runtime.config.block
+        ):
+            payload["network_block"] = runtime.config.block
         if self.config.builtin_tools is not None:
             payload["builtin_tools"] = list(self.config.builtin_tools)
         return {RLM_RUNTIME_METADATA_KEY: payload}
+
+    def _network_guidance(self, runtime: Runtime) -> bool | None:
+        if self.config.network_guidance is not None:
+            return self.config.network_guidance
+        # The rollout's runtime config already carries the task's network policy.
+        policy = runtime.config
+        if isinstance(policy, NetworkPolicyConfig) and not policy.allow:
+            return False
+        return None
 
     async def prepare_acp(
         self,
@@ -283,6 +293,8 @@ class RLMHarness(ACPHarness[RLMHarnessConfig]):
         if snapshot.session_id != trace.id:
             raise ValueError("RLM session snapshot does not match the rollout")
         trace.record_metrics(snapshot.metrics)
+        if trace.is_format_violation:
+            trace.stop("format_violation")
         if condition := _TRUNCATION_STOPS.get(snapshot.last_stop_reason or ""):
             trace.stop(condition)
 

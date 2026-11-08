@@ -6,7 +6,6 @@ and everything is torn down in `finally`. Mirrors how v0 vf-gepa bridged sync GE
 rollouts — a Ctrl-C raises on the main thread inside `optimize()` and unwinds through teardown."""
 
 import asyncio
-import logging
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
@@ -25,15 +24,16 @@ from verifiers.v1.gepa.dataset import (
     split_tasks,
 )
 from verifiers.v1.gepa.reflection import build_reflection_lm
+from verifiers.v1.utils.logging import get_logger
 from verifiers.v1.utils.trace_store import append_episode
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class _GEPALog:
     """Forwards GEPA's optimizer log lines to v1 logging. GEPA's `LoggerProtocol` needs only
     `.log(str)`, so its per-iteration progress rides the same loguru setup as the rest of the
-    v1 CLIs instead of a bespoke dashboard."""
+    v1 CLIs."""
 
     def log(self, message: str) -> None:
         logger.info(message)
@@ -109,13 +109,13 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
     if run_dir is not None:
         save_config(
             config, run_dir, "gepa.json"
-        )  # resolved config + a fresh traces.jsonl (like run_eval)
+        )  # resolved config + a fresh traces.jsonl
         reflective_dataset_path.write_text("", encoding="utf-8")
         logger.info("results: %s", run_dir)
 
     # optimize() is synchronous and blocking, so it drives the run from this (main) thread. We
-    # own one event loop: `env.serving()` (shared tool servers + interception pool, built once
-    # like run_eval) is entered on it, each rollout batch runs on it via `loop.run_until_complete`
+    # own one event loop: `env.serving()` (shared tool servers + interception pool, built
+    # once) is entered on it, each rollout batch runs on it via `loop.run_until_complete`
     # (GEPAAdapter.evaluate), and it's all torn down in `finally`. Keeping optimize() on the
     # main thread means a Ctrl-C raises straight through it into this teardown.
     loop = asyncio.new_event_loop()
@@ -123,7 +123,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
         asyncio.Semaphore(config.max_concurrent) if config.max_concurrent else None
     )
     # Stream every rollout's episode to traces.jsonl as it finalizes — the same persist hook
-    # run_eval passes to `env.run_slot` (each trace records its candidate prompt).
+    # `env.run_slot` takes (each trace records its candidate prompt).
     write_lock = asyncio.Lock()
 
     async def on_complete(episode: Episode) -> None:

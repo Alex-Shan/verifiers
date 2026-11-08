@@ -12,7 +12,6 @@ exception is `apply_overrides` (impose the eval's model + sampling in this forma
 """
 
 import json
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from glob import has_magic
@@ -26,15 +25,16 @@ from verifiers.v1.configs.harness import DialectName
 from verifiers.v1.configs.runtime import (
     NetworkPolicyConfig,
     intersect_network_hosts,
-    parse_network_rule,
 )
 from verifiers.v1.configs.sampling import Sampling, SamplingConfig
 from verifiers.v1.types import Request, Response
+from verifiers.v1.utils.logging import get_logger
+from verifiers.v1.utils.network import parse_network_rule
 
 RespT = TypeVar("RespT", bound=BaseModel)
 RawRequest = dict[str, Any]
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 PROVIDER_CAPABILITY_POLICY_CODE = "provider_capability_unavailable"
 CAPABILITY_NOTICE = (

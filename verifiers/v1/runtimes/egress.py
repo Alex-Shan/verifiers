@@ -12,7 +12,8 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import h11
 
-from verifiers.v1.configs.runtime import NetworkPolicyConfig, network_rule_matches
+from verifiers.v1.configs.runtime import NetworkPolicyConfig
+from verifiers.v1.utils.network import network_rule_matches
 
 HOST_ALIAS = "vf.host.internal"
 _CALLBACK_PREFIX = "/.vf-host/"

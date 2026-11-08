@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import logging
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -24,6 +23,8 @@ from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, Response
 from verifiers.v1.dialects.anthropic import (
     AnthropicDialect,
     message_from_response,
+)
+from verifiers.v1.dialects.anthropic import (
     parse_messages as parse_anthropic_messages,
 )
 from verifiers.v1.dialects.chat import message_to_wire
@@ -41,8 +42,9 @@ from verifiers.v1.types import (
     Usage,
     WeightVersionSpan,
 )
+from verifiers.v1.utils.logging import get_logger, isolated
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 T = TypeVar("T")
 
@@ -372,11 +374,12 @@ class ElasticRendererPool:
 
             slot = RendererSlot(await asyncio.to_thread(build))
             self.renderers.append(slot)
-            logger.info(
-                "renderer pool: %d renderer(s), multiplex=%d",
-                len(self.renderers),
-                self.multiplex,
-            )
+            with isolated():
+                logger.info(
+                    "Grew renderer pool to %d renderer(s) multiplex=%d",
+                    len(self.renderers),
+                    self.multiplex,
+                )
             return slot
 
     @asynccontextmanager

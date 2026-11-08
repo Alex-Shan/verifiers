@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
-import logging
 import math
 import shlex
 import tempfile
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -33,10 +33,12 @@ from verifiers.v1.runtimes.limiters import creation_limiter
 from verifiers.v1.runtimes.runtime import Runtime
 from verifiers.v1.utils.aio import run_shielded
 from verifiers.v1.utils.artifacts import validate_runtime_mounts
+from verifiers.v1.utils.format import format_time
+from verifiers.v1.utils.logging import get_logger
 from verifiers.v1.utils.prime import ensure_prime_auth
 from verifiers.v1.utils.scope import run_scope
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 EFFECTIVELY_UNBOUNDED_SECONDS = 30 * 24 * 60 * 60
 """Safety deadline for APIs that require a finite bound. Normal execution remains
@@ -111,7 +113,7 @@ async def leased_client() -> AsyncIterator[Any]:
 def set_base_sandbox_labels(labels: list[str]) -> None:
     """Set process-wide base labels attached to every Prime sandbox, extended by each
     runtime's ``PrimeConfig.labels``. Call it in the process that creates the sandboxes
-    (env-server workers set it via their setup hook) — e.g. a trainer stamps its run
+    (a host that spawns worker processes sets it in each one) — e.g. a trainer stamps its run
     name so every sandbox of a run is findable on the platform."""
     global BASE_LABELS
     BASE_LABELS = list(labels)
@@ -147,13 +149,15 @@ class PrimeProcess(RuntimeProcess):
 
 class PrimeBackend(RuntimeBackend):
     SUPPORTS_TASK_IMAGES: ClassVar[bool] = True
-    SUPPORTS_COMPOSE: ClassVar[bool] = True
     SUPPORTS_USER_SWITCHING: ClassVar[bool] = True
+    SUPPORTS_COMPOSE: ClassVar[bool] = True
     SUPPORTS_PORT_EXPOSURE: ClassVar[bool] = True
 
     def __init__(self, config: PrimeConfig, name: str | None = None) -> None:
         ensure_prime_auth()
         super().__init__(name)
+        self.user: str | None = None
+        self._workdir_override = config.workdir
         self.config = config.model_copy(update={"workdir": config.workdir or "/app"})
         self.info = PrimeRuntimeInfo(**self.config.model_dump())
         self._client = None
@@ -172,9 +176,13 @@ class PrimeBackend(RuntimeBackend):
         # 0.0.0.0, which `launch` arranges for a fixed published port.
         return SERVICE_PORT
 
+    def bind(self, *, env: Mapping[str, str] | None = None) -> Runtime:
+        return super().bind(env=env).with_user(self.user)
+
     async def start(self) -> None:
         from prime_sandboxes import APIError, CreateSandboxRequest
 
+        started = time.perf_counter()
         self._client = _lease_client()
         # Map the resources onto prime's API (minutes, split GPU; memory/disk are already
         # GB). gpu_type/region are only sent when set (else provider-chosen).
@@ -253,18 +261,27 @@ class PrimeBackend(RuntimeBackend):
             self.info.image_cached = sandbox.pending_image_build_id is None
             if not self.info.image_cached:
                 logger.warning(
-                    "prime: image %s isn't cached on the platform - auto-building it "
-                    "(sandbox %s waits for the build; first use of an image can take "
-                    "~10 minutes, later runs start in seconds)",
+                    "Building image %s on the platform for prime runtime %s - the "
+                    "first use of an image can take ~10 minutes, later runs start "
+                    "in seconds",
                     self.config.image,
                     self.info.id,
                 )
-            await self._client.wait_for_creation(self.info.id, max_attempts=180)
-            logger.info(
-                "prime: sandbox %s up (image=%s)", self.info.id, self.config.image
+            await self._client.wait_for_creation(self.info.id, max_attempts=900)
+            logger.debug(
+                "Started prime runtime %s in %s image=%s",
+                self.info.id,
+                format_time(time.perf_counter() - started),
+                self.config.image,
             )
             await self._client.execute_command(
                 self.info.id, f"mkdir -p {shlex.quote(self.config.workdir)}"
+            )
+            # Imported image filesystems may not map the VM's generated hostname.
+            await self._client.execute_command(
+                self.info.id,
+                'getent hosts "$(cat /proc/sys/kernel/hostname)" >/dev/null || '
+                'printf "127.0.1.1 %s\\n" "$(cat /proc/sys/kernel/hostname)" >> /etc/hosts',
             )
             await validate_runtime_mounts(self.bind(), [])
         except (
@@ -312,8 +329,8 @@ class PrimeBackend(RuntimeBackend):
             raise
         except Exception as e:
             raise SandboxError(f"prime egress policy failed: {e}") from e
-        logger.info(
-            "prime: egress policy applied on sandbox %s (allow=%s block=%s)",
+        logger.debug(
+            "Applied egress policy to prime runtime %s allow=%s block=%s",
             self.info.id,
             policy.get("allow"),
             policy.get("deny"),
@@ -535,7 +552,10 @@ class PrimeBackend(RuntimeBackend):
                     await client.delete(self.info.id)
             except Exception as e:  # noqa: BLE001 - provider teardown is best-effort
                 logger.warning(
-                    "prime: failed to delete sandbox %s: %s", self.info.id, e
+                    "Failed to delete prime runtime %s - %s: %s",
+                    self.info.id,
+                    type(e).__name__,
+                    e,
                 )
             if self._expose_network_id is not None:
                 try:
@@ -543,8 +563,9 @@ class PrimeBackend(RuntimeBackend):
                     self._expose_network_id = None
                 except Exception as e:  # noqa: BLE001 - provider teardown is best-effort
                     logger.warning(
-                        "prime: failed to delete LAN network %s: %s",
+                        "Failed to delete LAN network %s - %s: %s",
                         self._expose_network_id,
+                        type(e).__name__,
                         e,
                     )
         finally:

@@ -69,7 +69,7 @@ RECORD_FLOAT_DECIMALS = 4
 """Default precision of per-token float streams in JSON records (`to_record`). Full-precision
 digits are noise to every record reader and the least compressible bytes of a trace; four
 decimals leave a logprob within 1e-4 of what the trainer saw. `to_record(float_decimals=...)`
-overrides it per dump (`None` keeps every digit). The msgpack wire (`mode="python"`) keeps
+overrides it per dump (`None` keeps every digit). A python-mode dump keeps
 full precision — training never reads the record."""
 
 
@@ -88,19 +88,40 @@ ROUNDED_STREAMS = (
 """Float streams a JSON record rounds to `float_decimals`. Loss weights stay exact: a 1/T
 weight would round to zero."""
 
+RECORD_STREAMS = ("token_ids", "mask", "is_content", *ROUNDED_STREAMS, "loss_weights")
+"""Per-token node fields a JSON record (`to_record`) carries as numpy arrays — `loss_weights`
+as a dict of them — so an encoder writes each stream in one pass instead of element by
+element."""
+
+
+def round_stream(values: list | np.ndarray, decimals: int) -> np.ndarray:
+    """A float stream rounded to `decimals`, in float64."""
+    return np.round(np.asarray(values, dtype=np.float64), decimals)
+
+
+def _record_array(values: list | np.ndarray, decimals: int | None) -> np.ndarray:
+    """A stream as a record array: C-contiguous, which numpy-aware encoders require. Floats
+    widen to float64 so they print the digits a list of Python floats does — float32 would
+    print its own shortest form."""
+    array = np.asarray(values)
+    if array.dtype.kind == "f":
+        if decimals is not None:
+            return round_stream(array, decimals)
+        return array.astype(np.float64)
+    return np.ascontiguousarray(array)
+
 
 def _serialize_stream(
     values: list | np.ndarray, info: FieldSerializationInfo, rounded: bool
 ) -> list | dict:
-    """JSON records: a list. Python dumps: a list too, unless the context sets `token_arrays`,
-    when the msgpack wire carries a raw-bytes `__nd__` dict."""
+    """JSON dumps: a list. Python dumps: a list too, unless the context sets `token_arrays`,
+    when it is a raw-bytes `__nd__` dict for a binary wire."""
     context = info.context or {}
     if info.mode_is_json():
-        values = as_list(values)
         decimals = context.get("float_decimals", RECORD_FLOAT_DECIMALS)
         if not rounded or decimals is None:
-            return values
-        return [round(value, decimals) for value in values]
+            return as_list(values)
+        return round_stream(values, decimals).tolist()
     if context.get("token_arrays"):
         return encode_ndarray(np.asarray(values))
     return as_list(values)
@@ -206,6 +227,26 @@ class MessageNode(BaseModel):
             if self.renderer_token_ids is None
             else self.renderer_token_ids
         )
+
+    def record_streams(
+        self, float_decimals: int | None, exclude_none: bool
+    ) -> dict[str, Any]:
+        """This node's `RECORD_STREAMS` for its JSON record, as numpy arrays. Float streams
+        in `ROUNDED_STREAMS` are rounded to `float_decimals` (`None` keeps every digit)."""
+        streams: dict[str, Any] = {}
+        for name in RECORD_STREAMS:
+            values = getattr(self, name)
+            if values is None:
+                if not exclude_none:
+                    streams[name] = None
+            elif name == "loss_weights":
+                streams[name] = {
+                    key: _record_array(stream, None) for key, stream in values.items()
+                }
+            else:
+                decimals = float_decimals if name in ROUNDED_STREAMS else None
+                streams[name] = _record_array(values, decimals)
+        return streams
 
     @field_serializer("token_ids", "mask", "is_content", *ROUNDED_STREAMS)
     def serialize_token_stream(
