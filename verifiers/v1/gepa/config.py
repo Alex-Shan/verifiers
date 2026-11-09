@@ -78,6 +78,10 @@ class GEPAConfig(BaseConfig):
     """Stop after this many iterations without a better validation score."""
     reflection_minibatch_size: int = 3
     """Train tasks sampled per reflection step."""
+    efficiency_calibration_path: Path | None = None
+    """Shared frozen scales for efficiency arms with the same seed and setup."""
+    efficiency_objective: bool = False
+    """Use fixed 80/5/7.5/7.5 correctness/prompt/tokens/time scoring and compact reflection."""
     gr_gepa: bool = False
     """Compare repeated rollouts of each training task under the same candidate prompt."""
     group_size: int = Field(4, ge=2)
@@ -87,7 +91,7 @@ class GEPAConfig(BaseConfig):
     group_time_weight: float = Field(0.5, ge=0, le=1)
     """Share of the non-success score assigned to relative agent-time efficiency;
     the remainder rewards total-token brevity."""
-    group_success_threshold: float = Field(0.9, ge=0, lt=1)
+    group_success_threshold: float = Field(0.9, ge=0, le=1)
     """A GR-GEPA rollout succeeds when its reward reaches this threshold."""
     reflection_columns: list[str] = Field(default_factory=list)
     """Extra per-trace fields (from `trace.info`, else `task`) to surface to the teacher LM."""

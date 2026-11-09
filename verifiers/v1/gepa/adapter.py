@@ -9,10 +9,12 @@ thread, so a Ctrl-C unwinds straight through `optimize()` into the runner's tear
 """
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from gepa.core.adapter import EvaluationBatch
@@ -52,11 +54,18 @@ class GEPAAdapter:
     step. None = use GEPA's default reflection-LM proposer (the AttributeError from leaving it
     undeclared silently disables all mutation proposals)."""
     reflective_dataset_path: Path | None = None
+    system_prompt_prefix: str = ""
+    efficiency_objective: bool = False
+    count_prompt_tokens: Callable[[str], int] | None = None
+    efficiency_scales: dict[str, float] = field(default_factory=dict)
+    calibration_prompt: str | None = None
+    calibration_cache: dict[int, Episode] = field(default_factory=dict)
+    evaluation_metrics_path: Path | None = None
     gr_gepa: bool = False
     group_size: int = 4
     group_alpha: float = 0.5
     group_time_weight: float = 0.5
-    group_success_threshold: float = 1.0
+    group_success_threshold: float = 0.9
 
     def evaluate(
         self,
@@ -74,16 +83,61 @@ class GEPAAdapter:
             self.group_size if self.gr_gepa and idx in self.train_task_ids else 1
             for idx in batch
         ]
-        episodes = self.loop.run_until_complete(
-            self._run_batch(batch, system_prompt, counts)
-        )
+        if system_prompt == self.calibration_prompt and all(
+            idx in self.calibration_cache and n == 1 for idx, n in zip(batch, counts)
+        ):
+            episodes = [self.calibration_cache.pop(idx) for idx in batch]
+        else:
+            episodes = self.loop.run_until_complete(
+                self._run_batch(batch, system_prompt, counts)
+            )
+        # Infrastructure failures must behave identically in every scoring mode.
+        for episode in episodes:
+            _episode_score(episode)
+        if self.evaluation_metrics_path is not None:
+            prompt_id = hashlib.sha256(system_prompt.encode()).hexdigest()
+            with self.evaluation_metrics_path.open("a", encoding="utf-8") as file:
+                for episode in episodes:
+                    usage = getattr(episode, "usage", None)
+                    row = {
+                        "prompt_id": prompt_id,
+                        "system_prompt": system_prompt,
+                        "task_idx": episode.task.data.idx,
+                        "split": "train"
+                        if episode.task.data.idx in self.train_task_ids
+                        else "validation",
+                        "reward": _episode_score(episode),
+                        "num_total_tokens": episode.num_total_tokens,
+                        "provider_total_tokens": getattr(usage, "total_tokens", None),
+                        "timing": _episode_timing(episode),
+                    }
+                    if self.count_prompt_tokens is not None:
+                        row["prompt_tokens"] = self.count_prompt_tokens(system_prompt)
+                        # Other harnesses may insert their own unmeasured system prompts.
+                        row["full_system_prompt_tokens"] = (
+                            self.count_prompt_tokens(
+                                "\n\n".join(
+                                    p
+                                    for p in (self.system_prompt_prefix, system_prompt)
+                                    if p
+                                )
+                            )
+                            if self.system_prompt_prefix
+                            else None
+                        )
+                    file.write(json.dumps(row, ensure_ascii=False) + "\n")
         outputs: list[Trajectory] = []
         scores: list[float] = []
         offset = 0
         for n in counts:
             group = episodes[offset : offset + n]
             offset += n
-            if n > 1:
+            if self.efficiency_objective:
+                outputs.append(group if n > 1 else group[0])
+                scores.append(
+                    sum(self.efficiency_score(e, system_prompt) for e in group) / n
+                )
+            elif n > 1:
                 outputs.append(group)
                 scores.append(
                     sum(
@@ -104,6 +158,46 @@ class GEPAAdapter:
             scores=scores,
             trajectories=outputs if capture_traces else None,
             num_metric_calls=len(episodes),
+        )
+
+    def calibrate(self, batch: list[int], system_prompt: str) -> None:
+        """Freeze seed-validation scales and reuse these episodes in GEPA's initial eval."""
+        if not self.efficiency_objective or self.count_prompt_tokens is None:
+            raise ValueError("Efficiency calibration requires a prompt tokenizer")
+        episodes = self.loop.run_until_complete(
+            self._run_batch(batch, system_prompt, [1] * len(batch))
+        )
+        for episode in episodes:
+            _episode_score(episode)
+        lengths = [e.num_total_tokens for e in episodes if e.num_total_tokens > 0]
+        times = [_episode_timing(e)["agent"]["duration"] for e in episodes]
+        times = [t for t in times if t > 0]
+        if not lengths or not times:
+            raise ValueError(
+                "Calibration requires positive token and agent-time measurements"
+            )
+        self.efficiency_scales = {
+            "prompt": max(1, self.count_prompt_tokens(system_prompt)),
+            "tokens": median(lengths),
+            "agent_seconds": median(times),
+        }
+        self.calibration_prompt = system_prompt
+        self.calibration_cache = dict(zip(batch, episodes, strict=True))
+
+    def efficiency_score(self, episode: Episode, system_prompt: str) -> float:
+        if self.count_prompt_tokens is None or not self.efficiency_scales:
+            raise ValueError("Efficiency scoring requires frozen calibration scales")
+        reward = _episode_score(episode)
+        if reward not in (0.0, 1.0):
+            raise ValueError("Efficiency objective requires binary task rewards")
+        prompt = self.count_prompt_tokens(system_prompt)
+        tokens = episode.num_total_tokens
+        seconds = _episode_timing(episode)["agent"]["duration"]
+        return reward * (
+            0.8
+            + 0.05 / (1 + prompt / self.efficiency_scales["prompt"])
+            + 0.075 / (1 + tokens / self.efficiency_scales["tokens"])
+            + 0.075 / (1 + seconds / self.efficiency_scales["agent_seconds"])
         )
 
     async def _run_batch(
@@ -136,12 +230,22 @@ class GEPAAdapter:
         trajectories = eval_batch.trajectories or []
         records: list[dict[str, Any]] = []
         for trajectory in trajectories:
-            if isinstance(trajectory, list):
-                scores = _group_scores(
-                    trajectory,
-                    self.group_alpha,
-                    self.group_success_threshold,
-                    self.group_time_weight,
+            if isinstance(trajectory, list) or self.efficiency_objective:
+                trajectory = (
+                    trajectory if isinstance(trajectory, list) else [trajectory]
+                )
+                scores = (
+                    [
+                        self.efficiency_score(e, candidate.get("system_prompt", ""))
+                        for e in trajectory
+                    ]
+                    if self.efficiency_objective
+                    else _group_scores(
+                        trajectory,
+                        self.group_alpha,
+                        self.group_success_threshold,
+                        self.group_time_weight,
+                    )
                 )
                 rollouts = []
                 for episode, score in zip(trajectory, scores, strict=True):
@@ -160,13 +264,18 @@ class GEPAAdapter:
                 records.append(
                     {
                         "comparison_guidance": (
-                            "Compare rollouts of this same task. Diagnose recurring errors and "
-                            "separate task difficulty from prompt strategy. `reward` is the "
-                            "original task score. `score` combines success, relative total-token "
-                            "brevity, and relative agent time. `timing.agent` records total "
-                            "seconds, with `model` and `harness` breakdowns; propose a "
-                            "generalizable prompt revision."
+                            EFFICIENCY_GUIDANCE
+                            if self.efficiency_objective
+                            else "Compare repeated rollouts of the same task. Diagnose recurring errors; "
+                            "score combines success and within-group relative tokens and agent time. "
+                            "Propose a generalizable prompt revision."
                         ),
+                        "efficiency_scales": self.efficiency_scales,
+                        "parent_prompt_tokens": self.count_prompt_tokens(
+                            candidate.get("system_prompt", "")
+                        )
+                        if self.count_prompt_tokens
+                        else None,
                         "parent_prompt": candidate.get("system_prompt", ""),
                         "query": to_jsonable_python(trajectory[0].task.data.prompt),
                         "rollouts": rollouts,
@@ -296,3 +405,24 @@ def _group_scores(
             episodes, brevities, time_efficiencies, strict=True
         )
     ]
+
+
+EFFICIENCY_GUIDANCE = (
+    "Compare repeated rollouts of the same task under the same parent prompt. "
+    "Revise only the evolvable task system prompt. Maximize the weighted score: "
+    "correctness 80%, prompt-token efficiency 5%, episode total-token efficiency 7.5%, "
+    "and agent-time efficiency 7.5%. Efficiency bonuses apply only to correct rollouts. "
+    "Each efficiency term is 1/(1+cost/frozen_seed_scale); compare absolute costs, not "
+    "candidate-specific min-max scores. Seek the shortest sufficient prompt. Remove "
+    "redundant instructions, task-specific facts, worked examples, and repeated tool "
+    "documentation. Add instructions only when expected correctness or execution "
+    "savings justify their prompt cost. num_total_tokens measures episode token use, "
+    "not final-answer length or provider-billed totals. timing.agent.duration measures "
+    "agent seconds; model and harness are diagnostic breakdowns. Learn strategies "
+    "that avoid repeated library discovery, redundant tool calls, unnecessary output, "
+    "and repeated solution attempts after adequate verification. Preserve checks "
+    "needed for feasibility, optimality, and a correct final answer in \\boxed{}. "
+    "Use failures to identify missing safeguards, never as examples of efficiency. "
+    "Do not infer improvement from timing alone or overfit to one stochastic rollout. "
+    "Return a compact, generalizable replacement prompt."
+)

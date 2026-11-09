@@ -6,6 +6,10 @@ and everything is torn down in `finally`. Mirrors how v0 vf-gepa bridged sync GE
 rollouts — a Ctrl-C raises on the main thread inside `optimize()` and unwinds through teardown."""
 
 import asyncio
+import contextlib
+import fcntl
+import hashlib
+import json
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
@@ -23,7 +27,10 @@ from verifiers.v1.gepa.dataset import (
     resolve_gepa_seed_prompt,
     split_tasks,
 )
-from verifiers.v1.gepa.reflection import build_reflection_lm
+from verifiers.v1.gepa.reflection import (
+    EFFICIENCY_REFLECTION_TEMPLATE,
+    build_reflection_lm,
+)
 from verifiers.v1.utils.logging import get_logger
 from verifiers.v1.utils.trace_store import append_episode
 
@@ -37,6 +44,21 @@ class _GEPALog:
 
     def log(self, message: str) -> None:
         logger.info(message)
+
+
+@contextlib.contextmanager
+def _calibration_lock(path):
+    """Serialize shared scale initialization across concurrent experiment arms."""
+    if path is None:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _stopping_kwargs(config: GEPAConfig) -> dict:
@@ -152,12 +174,100 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 on_complete=on_complete,
                 reflection_columns=config.reflection_columns,
                 reflective_dataset_path=reflective_dataset_path,
+                efficiency_objective=config.efficiency_objective,
+                evaluation_metrics_path=run_dir / "evaluation_metrics.jsonl"
+                if run_dir
+                else None,
                 gr_gepa=config.gr_gepa,
                 group_size=config.group_size,
                 group_alpha=config.group_alpha,
                 group_time_weight=config.group_time_weight,
                 group_success_threshold=config.group_success_threshold,
             )
+            from verifiers.v1.harnesses.hero_python.harness import (
+                HeroPythonHarnessConfig,
+            )
+
+            hero_python = (
+                isinstance(
+                    getattr(config.env, "agent", None).harness, HeroPythonHarnessConfig
+                )
+                if getattr(config.env, "agent", None)
+                else False
+            )
+            if config.efficiency_objective or hero_python:
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    config.model, local_files_only=True
+                )
+                adapter.count_prompt_tokens = lambda text: len(
+                    tokenizer.encode(text, add_special_tokens=False)
+                )
+            if hero_python:
+                from verifiers.v1.harnesses.hero_python.prompt import (
+                    HERO_PYTHON_SYSTEM_PROMPT,
+                )
+
+                adapter.system_prompt_prefix = HERO_PYTHON_SYSTEM_PROMPT
+            if config.efficiency_objective:
+                calibration_path = config.efficiency_calibration_path
+                identity = {
+                    "model": config.model,
+                    "seed": config.seed,
+                    "prompt": seed_prompt,
+                    "sampling": config.sampling.model_dump(mode="json"),
+                    "env": config.env.model_dump(mode="json"),
+                    "validation": hashlib.sha256(
+                        repr([(t.data.idx, t.data.prompt) for t in val_tasks]).encode()
+                    ).hexdigest(),
+                }
+                with _calibration_lock(calibration_path):
+                    if calibration_path is not None and calibration_path.exists():
+                        calibration = json.loads(calibration_path.read_text())
+                        if calibration["identity"] != identity:
+                            raise ValueError(
+                                "Shared calibration does not match this experiment setup"
+                            )
+                        adapter.efficiency_scales = calibration["scales"]
+                        if set(adapter.efficiency_scales) != {
+                            "prompt",
+                            "tokens",
+                            "agent_seconds",
+                        } or any(
+                            not isinstance(v, (int, float)) or not 0 < v < float("inf")
+                            for v in adapter.efficiency_scales.values()
+                        ):
+                            raise ValueError(
+                                "Shared calibration scales must be finite and positive"
+                            )
+                    else:
+                        if (
+                            config.max_total_rollouts is not None
+                            and config.max_total_rollouts < len(val_tasks)
+                        ):
+                            raise ValueError(
+                                "Rollout budget must cover seed validation calibration"
+                            )
+                        adapter.calibrate(
+                            [task.data.idx for task in val_tasks], seed_prompt
+                        )
+                        if calibration_path is not None:
+                            calibration_path.parent.mkdir(parents=True, exist_ok=True)
+                            with calibration_path.open("x", encoding="utf-8") as file:
+                                json.dump(
+                                    {
+                                        "identity": identity,
+                                        "scales": adapter.efficiency_scales,
+                                    },
+                                    file,
+                                    indent=2,
+                                )
+                if run_dir is not None:
+                    (run_dir / "efficiency_scales.json").write_text(
+                        json.dumps(adapter.efficiency_scales, indent=2),
+                        encoding="utf-8",
+                    )
             optimize_kwargs: dict = {
                 "seed_candidate": {"system_prompt": seed_prompt},
                 "trainset": [task.data.idx for task in train_tasks],
@@ -168,7 +278,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 "run_dir": str(run_dir) if run_dir is not None else None,
                 "seed": config.seed,
                 "display_progress_bar": False,
-                "skip_perfect_score": True,
+                "skip_perfect_score": not config.efficiency_objective,
                 "perfect_score": 1.0,
                 "logger": _GEPALog(),
                 "use_wandb": config.use_wandb,
@@ -188,6 +298,10 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 },
                 "sampling_strategy": PxNSampling(p=2, n=2),
             }
+            if config.efficiency_objective:
+                optimize_kwargs["reflection_prompt_template"] = (
+                    EFFICIENCY_REFLECTION_TEMPLATE
+                )
             optimize_kwargs.update(_stopping_kwargs(config))
             result = optimize(**optimize_kwargs)
             if run_dir is not None:

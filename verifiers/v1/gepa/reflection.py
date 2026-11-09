@@ -5,6 +5,8 @@ worker thread running `optimize()`, so each call drives the async `complete` on 
 """
 
 import asyncio
+import json
+import time
 from collections.abc import Callable
 
 from verifiers.v1.configs.judge import JudgeConfig
@@ -26,6 +28,37 @@ def build_reflection_lm(config: GEPAConfig) -> Callable[[str], str]:
     )
 
     def reflection_lm(prompt: str) -> str:
-        return asyncio.run(judge.complete(prompt)).text
+        started = time.perf_counter()
+        response = asyncio.run(judge.complete(prompt))
+        if config.save_results:
+            path = config.output_dir / config.run.dir / "reflection_metrics.jsonl"
+            with path.open("a", encoding="utf-8") as file:
+                file.write(
+                    json.dumps(
+                        {
+                            "seconds": time.perf_counter() - started,
+                            "usage": response.usage.model_dump(mode="json")
+                            if response.usage
+                            else None,
+                        }
+                    )
+                    + "\n"
+                )
+        return response.text
 
     return reflection_lm
+
+
+EFFICIENCY_REFLECTION_TEMPLATE = """Write a compact replacement task system prompt.
+Current task system prompt:
+<curr_param>
+
+Rollouts and feedback:
+<side_info>
+
+Optimize the stated weighted correctness and efficiency objective. The fixed harness
+already documents tools; do not repeat it. Keep only generalizable instructions whose
+benefit justifies their token cost. Do not accumulate examples or task-specific facts.
+Allow additional text only when its expected correctness or execution savings justify
+its cost. Return only the replacement instructions in a single fenced code block.
+"""

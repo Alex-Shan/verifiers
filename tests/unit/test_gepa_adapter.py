@@ -176,3 +176,76 @@ def test_group_time_weight_config_default_and_bounds():
     )
     with pytest.raises(ValidationError):
         GEPAConfig.model_validate({"group_time_weight": 1.01})
+
+
+def _efficient_adapter(**kwargs):
+    return GEPAAdapter(
+        env=None,
+        ctx=None,
+        tasks={},
+        loop=None,
+        efficiency_objective=True,
+        count_prompt_tokens=len,
+        efficiency_scales={"prompt": 10, "tokens": 100, "agent_seconds": 10},
+        **kwargs,
+    )
+
+
+def test_efficiency_rewards_absolute_cost_reductions_and_prompt_compression():
+    adapter = _efficient_adapter()
+    short = _episode(1, 100, [(5, 5)])
+    long = _episode(1, 1000, [(50, 50)])
+    assert adapter.efficiency_score(short, "x" * 10) == pytest.approx(0.9)
+    assert adapter.efficiency_score(short, "x" * 10) > adapter.efficiency_score(
+        long, "x" * 10
+    )
+    assert adapter.efficiency_score(short, "x") > adapter.efficiency_score(
+        short, "x" * 10
+    )
+    assert adapter.efficiency_score(_episode(0, 1, [(0.1, 0.1)]), "x") == 0
+    with pytest.raises(ValueError, match="binary"):
+        adapter.efficiency_score(_episode(0.5, 1, [(1, 1)]), "x")
+
+
+def test_efficiency_calibration_cache_is_counted_once_and_consumed():
+    episode = _episode(1, 100, [(5, 5)])
+    adapter = _efficient_adapter()
+    adapter.loop = _ImmediateLoop([episode])
+    adapter.calibrate([8], "x" * 10)
+    adapter.loop = None  # Cached evaluation must not call the event loop.
+    batch = adapter.evaluate([8], {"system_prompt": "x" * 10}, capture_traces=True)
+    assert batch.num_metric_calls == 1
+    assert batch.scores == pytest.approx([0.9])
+    assert not adapter.calibration_cache
+    assert batch.trajectories == [episode]
+
+
+def test_efficiency_validation_and_group_training_share_scoring():
+    episode = _episode(1, 100, [(5, 5)])
+    adapter = _efficient_adapter(gr_gepa=True, group_size=2, train_task_ids={7})
+    adapter.loop = _ImmediateLoop([episode, episode])
+    group = adapter.evaluate([7], {"system_prompt": "x" * 10}, True)
+    adapter.loop = _ImmediateLoop([episode])
+    single = adapter.evaluate([8], {"system_prompt": "x" * 10}, True)
+    assert group.scores == single.scores == pytest.approx([0.9])
+    assert group.num_metric_calls == 2
+    assert single.num_metric_calls == 1
+    records = adapter.make_reflective_dataset(
+        {"system_prompt": "x" * 10}, single, ["system_prompt"]
+    )["system_prompt"]
+    assert records[0]["rollouts"][0]["score"] == pytest.approx(0.9)
+    assert records[0]["parent_prompt_tokens"] == 10
+    assert adapter.efficiency_scales == {
+        "prompt": 10,
+        "tokens": 100,
+        "agent_seconds": 10,
+    }
+
+
+def test_efficiency_rejects_failed_infrastructure_and_accepts_threshold_one():
+    episode = _episode(0, 1, [(1, 1)], ok=False)
+    episode.id = "failed"
+    adapter = _efficient_adapter()
+    with pytest.raises(ValueError, match="failed episode"):
+        adapter.efficiency_score(episode, "x")
+    assert GEPAConfig(group_success_threshold=1).group_success_threshold == 1
