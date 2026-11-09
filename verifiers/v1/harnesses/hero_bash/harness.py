@@ -79,7 +79,7 @@ class HeroHarness(Harness[HeroHarnessConfig]):
     ) -> ProgramResult:
         if mcp_urls:
             raise ValueError(
-                "hero only supports the bash tool; MCP tools are not supported"
+                "hero_bash only supports the bash tool; MCP tools are not supported"
             )
         system_prompt, prompt = self.resolve_prompt(data)
         system_prompt = "\n\n".join(p for p in (BASH_SYSTEM_PROMPT, system_prompt) if p)
