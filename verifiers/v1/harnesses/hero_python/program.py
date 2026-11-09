@@ -7,17 +7,21 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import certifi
 import httpx
 from openai import APIStatusError, AsyncOpenAI, DefaultAsyncHttpxClient
 
-from verifiers.v1.harnesses.utils.compaction import (
-    Compactor,
-    bound_tool_message,
-    is_context_overflow,
-)
-from verifiers.v1.harnesses.utils.core import gate_tool_call
+if TYPE_CHECKING:
+    # The harness bundles these modules into the generated script before execution;
+    # verifiers itself is not installed in the task container.
+    from verifiers.v1.harnesses.utils.compaction import (
+        Compactor,  # noqa: TC004
+        bound_tool_message,  # noqa: TC004
+        is_context_overflow,  # noqa: TC004
+    )
+    from verifiers.v1.harnesses.utils.core import gate_tool_call  # noqa: TC004
 
 # Must match STOP_MARKER in harness.py.
 STOP_MARKER = "VF_HERO_PYTHON_STOP="
