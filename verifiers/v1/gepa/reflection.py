@@ -37,6 +37,7 @@ def build_reflection_lm(config: GEPAConfig) -> Callable[[str], str]:
                     json.dumps(
                         {
                             "seconds": time.perf_counter() - started,
+                            "response_text": response.text,
                             "usage": response.usage.model_dump(mode="json")
                             if response.usage
                             else None,
@@ -60,5 +61,8 @@ Optimize the stated weighted correctness and efficiency objective. The fixed har
 already documents tools; do not repeat it. Keep only generalizable instructions whose
 benefit justifies their token cost. Do not accumulate examples or task-specific facts.
 Allow additional text only when its expected correctness or execution savings justify
-its cost. Return only the replacement instructions in a single fenced code block.
+its cost. Before the replacement, explain observed success/failure differences and cost differences
+between successful trajectories. Mark unavailable comparisons explicitly. Propose concrete
+edits and explain their expected benefits and costs without claiming unmeasured gains.
+Return the replacement instructions in exactly one fenced code block.
 """

@@ -59,8 +59,9 @@ class GEPAAdapter:
     count_prompt_tokens: Callable[[str], int] | None = None
     efficiency_scales: dict[str, float] = field(default_factory=dict)
     calibration_prompt: str | None = None
-    calibration_cache: dict[int, Episode] = field(default_factory=dict)
+    calibration_cache: dict[int, Episode | list[Episode]] = field(default_factory=dict)
     evaluation_metrics_path: Path | None = None
+    validation_rollouts: int = 1
     gr_gepa: bool = False
     group_size: int = 4
     group_alpha: float = 0.5
@@ -80,13 +81,21 @@ class GEPAAdapter:
         `run_until_complete`."""
         system_prompt = candidate.get("system_prompt", "")
         counts = [
-            self.group_size if self.gr_gepa and idx in self.train_task_ids else 1
+            (self.group_size if self.gr_gepa else 1)
+            if idx in self.train_task_ids
+            else self.validation_rollouts
             for idx in batch
         ]
         if system_prompt == self.calibration_prompt and all(
-            idx in self.calibration_cache and n == 1 for idx, n in zip(batch, counts)
+            idx in self.calibration_cache and n == self.validation_rollouts
+            for idx, n in zip(batch, counts)
         ):
-            episodes = [self.calibration_cache.pop(idx) for idx in batch]
+            cached = [self.calibration_cache.pop(idx) for idx in batch]
+            episodes = [
+                e
+                for item in cached
+                for e in (item if isinstance(item, list) else [item])
+            ]
         else:
             episodes = self.loop.run_until_complete(
                 self._run_batch(batch, system_prompt, counts)
@@ -97,12 +106,16 @@ class GEPAAdapter:
         if self.evaluation_metrics_path is not None:
             prompt_id = hashlib.sha256(system_prompt.encode()).hexdigest()
             with self.evaluation_metrics_path.open("a", encoding="utf-8") as file:
+                sample_counts = {}
                 for episode in episodes:
+                    task_id = episode.task.data.idx
+                    sample_counts[task_id] = sample_counts.get(task_id, 0) + 1
                     usage = getattr(episode, "usage", None)
                     row = {
                         "prompt_id": prompt_id,
                         "system_prompt": system_prompt,
                         "task_idx": episode.task.data.idx,
+                        "sample_idx": sample_counts[task_id],
                         "split": "train"
                         if episode.task.data.idx in self.train_task_ids
                         else "validation",
@@ -129,10 +142,53 @@ class GEPAAdapter:
         outputs: list[Trajectory] = []
         scores: list[float] = []
         offset = 0
-        for n in counts:
+        for task_idx, n in zip(batch, counts):
             group = episodes[offset : offset + n]
             offset += n
-            if self.efficiency_objective:
+            if task_idx not in self.train_task_ids and n > 1:
+                accuracy = sum(_episode_score(e) for e in group) / n
+                tokens = sum(e.num_total_tokens for e in group) / n
+                seconds = (
+                    sum(_episode_timing(e)["agent"]["duration"] for e in group) / n
+                )
+                value = accuracy
+                if self.efficiency_objective:
+                    scales = self.efficiency_scales
+                    value *= (
+                        0.8
+                        + 0.05
+                        / (
+                            1
+                            + self.count_prompt_tokens(system_prompt) / scales["prompt"]
+                        )
+                        + 0.075 / (1 + tokens / scales["tokens"])
+                        + 0.075 / (1 + seconds / scales["agent_seconds"])
+                    )
+                outputs.append(group)
+                scores.append(value)
+                if self.evaluation_metrics_path is not None:
+                    record = {
+                        "prompt_id": hashlib.sha256(system_prompt.encode()).hexdigest(),
+                        "task_idx": task_idx,
+                        "n": n,
+                        "c": sum(_episode_score(e) for e in group),
+                        "pass_at_1": accuracy,
+                        "pass_at_4": (float(accuracy > 0) if n == 4 else None),
+                        "all_wrong": accuracy == 0,
+                        "mixed": 0 < accuracy < 1,
+                        "all_correct": accuracy == 1,
+                        "tokens_mean": tokens,
+                        "agent_seconds_mean": seconds,
+                        "score": value,
+                        "prompt_tokens": self.count_prompt_tokens(system_prompt)
+                        if self.count_prompt_tokens
+                        else None,
+                    }
+                    with self.evaluation_metrics_path.with_name(
+                        "validation_metrics.jsonl"
+                    ).open("a") as file:
+                        file.write(json.dumps(record) + "\n")
+            elif self.efficiency_objective:
                 outputs.append(group if n > 1 else group[0])
                 scores.append(
                     sum(self.efficiency_score(e, system_prompt) for e in group) / n
@@ -165,12 +221,22 @@ class GEPAAdapter:
         if not self.efficiency_objective or self.count_prompt_tokens is None:
             raise ValueError("Efficiency calibration requires a prompt tokenizer")
         episodes = self.loop.run_until_complete(
-            self._run_batch(batch, system_prompt, [1] * len(batch))
+            self._run_batch(
+                batch, system_prompt, [self.validation_rollouts] * len(batch)
+            )
         )
         for episode in episodes:
             _episode_score(episode)
-        lengths = [e.num_total_tokens for e in episodes if e.num_total_tokens > 0]
-        times = [_episode_timing(e)["agent"]["duration"] for e in episodes]
+        groups = [
+            episodes[i : i + self.validation_rollouts]
+            for i in range(0, len(episodes), self.validation_rollouts)
+        ]
+        lengths = [sum(e.num_total_tokens for e in g) / len(g) for g in groups]
+        lengths = [v for v in lengths if v > 0]
+        times = [
+            sum(_episode_timing(e)["agent"]["duration"] for e in g) / len(g)
+            for g in groups
+        ]
         times = [t for t in times if t > 0]
         if not lengths or not times:
             raise ValueError(
@@ -182,7 +248,13 @@ class GEPAAdapter:
             "agent_seconds": median(times),
         }
         self.calibration_prompt = system_prompt
-        self.calibration_cache = dict(zip(batch, episodes, strict=True))
+        self.calibration_cache = dict(
+            zip(
+                batch,
+                [g[0] if self.validation_rollouts == 1 else g for g in groups],
+                strict=True,
+            )
+        )
 
     def efficiency_score(self, episode: Episode, system_prompt: str) -> float:
         if self.count_prompt_tokens is None or not self.efficiency_scales:
@@ -263,6 +335,27 @@ class GEPAAdapter:
                     )
                 records.append(
                     {
+                        "comparison_summary": {
+                            "successes": sum(r["reward"] == 1 for r in rollouts),
+                            "failures": sum(r["reward"] == 0 for r in rollouts),
+                            "outcomes_comparable": any(
+                                r["reward"] == 1 for r in rollouts
+                            )
+                            and any(r["reward"] == 0 for r in rollouts),
+                            "successful_costs": [
+                                {
+                                    "sample_idx": i + 1,
+                                    "tokens": r["num_total_tokens"],
+                                    "seconds": r["timing"]["agent"]["duration"],
+                                }
+                                for i, r in enumerate(rollouts)
+                                if r["reward"] == 1
+                            ],
+                            "success_cost_comparison_available": sum(
+                                r["reward"] == 1 for r in rollouts
+                            )
+                            > 1,
+                        },
                         "comparison_guidance": (
                             EFFICIENCY_GUIDANCE
                             if self.efficiency_objective

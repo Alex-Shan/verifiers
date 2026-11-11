@@ -62,6 +62,8 @@ class GEPAConfig(BaseConfig):
     """Legacy top-level alias for `select.shuffle`."""
     num_train: int = Field(100, ge=1)
     """Tasks reserved for reflection minibatches (GEPA never scores the full trainset at once)."""
+    validation_rollouts: int = Field(1, ge=1)
+    """Independent samples per validation task; report their mean correctness."""
     num_val: int = Field(50, ge=1)
     """Tasks held out to score each candidate system prompt for the pareto frontier."""
     seed: int = 0
@@ -71,7 +73,7 @@ class GEPAConfig(BaseConfig):
 
     max_total_rollouts: int | None = Field(None, ge=1)
     """Rollout budget. Defaults to 500 when no other stopping condition is selected.
-    In GR-GEPA, each training task uses `group_size` rollouts; validation uses one."""
+    In GR-GEPA, each training task uses `group_size` rollouts; validation uses validation_rollouts."""
     max_iterations: int | None = Field(None, ge=1)
     """Stop after this many GEPA optimization iterations."""
     max_iterations_without_improvement: int | None = Field(None, ge=1)
@@ -85,7 +87,7 @@ class GEPAConfig(BaseConfig):
     gr_gepa: bool = False
     """Compare repeated rollouts of each training task under the same candidate prompt."""
     group_size: int = Field(4, ge=2)
-    """Rollouts per training task when GR-GEPA is enabled. Validation always uses one."""
+    """Rollouts per training task when GR-GEPA is enabled. Validation uses validation_rollouts."""
     group_alpha: float = Field(0.9, ge=0, le=1)
     """Weight of task success; the remainder rewards efficiency among successful rollouts."""
     group_time_weight: float = Field(0.5, ge=0, le=1)

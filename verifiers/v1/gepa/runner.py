@@ -13,7 +13,6 @@ import json
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
-from gepa.strategies.proposal_sampling import PxNSampling
 from gepa.utils import MaxCandidateProposalsStopper, NoImprovementStopper
 
 from verifiers.v1.cli.output import output_path, save_config
@@ -66,7 +65,7 @@ def _stopping_kwargs(config: GEPAConfig) -> dict:
         return {"max_metric_calls": config.max_total_rollouts}
     if config.max_iterations is not None:
         # This stopper checks GEPA's state.i, which counts completed loop
-        # iterations even when PxNSampling proposes several candidates.
+        # iterations independently of training rollout group size.
         return {"stop_callbacks": MaxCandidateProposalsStopper(config.max_iterations)}
     assert config.max_iterations_without_improvement is not None
     return {
@@ -178,6 +177,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 evaluation_metrics_path=run_dir / "evaluation_metrics.jsonl"
                 if run_dir
                 else None,
+                validation_rollouts=config.validation_rollouts,
                 gr_gepa=config.gr_gepa,
                 group_size=config.group_size,
                 group_alpha=config.group_alpha,
@@ -222,6 +222,9 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                         repr([(t.data.idx, t.data.prompt) for t in val_tasks]).encode()
                     ).hexdigest(),
                 }
+                identity["validation_rollouts"] = config.validation_rollouts
+                identity["validation_protocol"] = "mean-pass1-v2"
+                identity["effective_env"] = config.env.model_dump(mode="json")
                 with _calibration_lock(calibration_path):
                     if calibration_path is not None and calibration_path.exists():
                         calibration = json.loads(calibration_path.read_text())
@@ -244,7 +247,8 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                     else:
                         if (
                             config.max_total_rollouts is not None
-                            and config.max_total_rollouts < len(val_tasks)
+                            and config.max_total_rollouts
+                            < len(val_tasks) * config.validation_rollouts
                         ):
                             raise ValueError(
                                 "Rollout budget must cover seed validation calibration"
@@ -296,7 +300,6 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                         "seed": config.seed,
                     },
                 },
-                "sampling_strategy": PxNSampling(p=2, n=2),
             }
             if config.efficiency_objective:
                 optimize_kwargs["reflection_prompt_template"] = (
@@ -318,6 +321,14 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 logger.info("best system prompt: %s", best_path)
             return result
         finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             loop.run_until_complete(serving.__aexit__(None, None, None))
     finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
