@@ -10,9 +10,11 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import random
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
+from gepa.strategies.proposal_sampling import PxNSampling
 from gepa.utils import MaxCandidateProposalsStopper, NoImprovementStopper
 
 from verifiers.v1.cli.output import output_path, save_config
@@ -20,6 +22,7 @@ from verifiers.v1.clients import ModelContext
 from verifiers.v1.env import Env
 from verifiers.v1.episode import Episode
 from verifiers.v1.gepa.adapter import GEPAAdapter
+from verifiers.v1.gepa.batch_sampler import CursorEpochShuffledBatchSampler
 from verifiers.v1.gepa.config import GEPAConfig
 from verifiers.v1.gepa.dataset import (
     load_tasks_from_path,
@@ -278,7 +281,12 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 "valset": [task.data.idx for task in val_tasks],
                 "adapter": adapter,
                 "reflection_lm": reflection_lm,
-                "reflection_minibatch_size": config.reflection_minibatch_size,
+                # GEPA requires this to be None when passing a custom sampler.
+                "reflection_minibatch_size": None,
+                "batch_sampler": CursorEpochShuffledBatchSampler(
+                    config.reflection_minibatch_size, rng=random.Random(config.seed)
+                ),
+                "sampling_strategy": PxNSampling(p=2, n=2),
                 "run_dir": str(run_dir) if run_dir is not None else None,
                 "seed": config.seed,
                 "display_progress_bar": False,
@@ -294,6 +302,10 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                         "model": config.model,
                         "num_train": len(train_tasks),
                         "num_val": len(val_tasks),
+                        "proposal_parents": 2,
+                        "mutations_per_parent": 2,
+                        "batch_sampler": "cursor_epoch_shuffled",
+                        "reflection_minibatch_size": config.reflection_minibatch_size,
                         "max_total_rollouts": config.max_total_rollouts,
                         "max_iterations": config.max_iterations,
                         "max_iterations_without_improvement": config.max_iterations_without_improvement,

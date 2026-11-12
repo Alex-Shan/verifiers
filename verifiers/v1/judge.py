@@ -81,6 +81,7 @@ class JudgeResponse(BaseModel, Generic[ParsedT]):
     text: str
     parsed: ParsedT | None = None
     usage: Usage | None = None
+    finish_reason: str | None = None
 
 
 JudgeView = Literal["last_reply", "full_trace"]
@@ -211,6 +212,7 @@ class Judge(Generic[ParsedT, ConfigT]):
                         text=choice.message.content or "",
                         parsed=choice.message.parsed,
                         usage=Usage.from_openai(completion.usage),
+                        finish_reason=completion.choices[0].finish_reason,
                     )
                     if choice.message.refusal is not None:
                         raise RuntimeError(
@@ -225,6 +227,7 @@ class Judge(Generic[ParsedT, ConfigT]):
                     response = JudgeResponse(
                         text=completion.choices[0].message.content or "",
                         usage=Usage.from_openai(completion.usage),
+                        finish_reason=completion.choices[0].finish_reason,
                     )
             if parse is not None:
                 response.parsed = parse(response)

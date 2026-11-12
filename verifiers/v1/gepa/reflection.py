@@ -1,20 +1,96 @@
-"""The reflection (teacher) LM: GEPA's proposer calls this synchronously to turn a prompt into
-text. Backed by a vf `Judge` — `Judge.complete` owns the model client (same key / header /
-Prime-billing resolution rollouts use), so we never build one here. GEPA calls it from the
-worker thread running `optimize()`, so each call drives the async `complete` on a private loop.
-"""
+"""Bounded parallel teacher calls with prompt validation and response diagnostics."""
 
 import asyncio
+import hashlib
 import json
 import time
-from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from gepa.strategies.instruction_proposal import InstructionProposalSignature
 
 from verifiers.v1.configs.judge import JudgeConfig
 from verifiers.v1.gepa.config import GEPAConfig
 from verifiers.v1.judge import Judge
+from verifiers.v1.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
-def build_reflection_lm(config: GEPAConfig) -> Callable[[str], str]:
+class ReflectionLM:
+    """Expose GEPA's callable and batch_complete interfaces on one async path."""
+
+    def __init__(self, judge: Judge, path: Path | None, max_concurrent: int = 4):
+        self.judge = judge
+        self.path = path
+        self.max_concurrent = max_concurrent
+
+    def __call__(self, prompt: Any) -> str:
+        return self.batch_complete([prompt])[0]
+
+    def batch_complete(self, messages_list: list[Any]) -> list[str]:
+        return asyncio.run(self._batch_complete(messages_list))
+
+    async def _batch_complete(self, prompts: list[Any]) -> list[str]:
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        results = await asyncio.gather(
+            *(self._complete(prompt, semaphore) for prompt in prompts),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
+
+    async def _complete(self, prompt: Any, semaphore: asyncio.Semaphore) -> str:
+        prompt_id = hashlib.sha256(
+            json.dumps(prompt, ensure_ascii=False, sort_keys=True).encode()
+        ).hexdigest()
+        for attempt in range(1, 3):
+            async with semaphore:
+                started = time.perf_counter()
+                response = await self.judge.complete(prompt)
+                error = None
+                try:
+                    instruction = InstructionProposalSignature.output_extractor(
+                        response.text.strip()
+                    )["new_instruction"]
+                    if not instruction.strip():
+                        error = "empty replacement prompt"
+                except (KeyError, ValueError) as exc:
+                    error = str(exc)
+                if not response.text.strip():
+                    error = "empty response content"
+                if self.path is not None:
+                    with self.path.open("a", encoding="utf-8") as file:
+                        file.write(
+                            json.dumps(
+                                {
+                                    "seconds": time.perf_counter() - started,
+                                    "response_text": response.text,
+                                    "usage": response.usage.model_dump(mode="json")
+                                    if response.usage
+                                    else None,
+                                    "finish_reason": response.finish_reason,
+                                    "prompt_id": prompt_id,
+                                    "attempt": attempt,
+                                    "valid_prompt": error is None,
+                                    "validation_error": error,
+                                }
+                            )
+                            + "\n"
+                        )
+                if error is None:
+                    return response.text
+            if attempt < 2:
+                logger.warning(
+                    "Retrying reflection after invalid output (attempt 2/2) - %s",
+                    error,
+                )
+        raise ValueError(f"Reflection returned no valid replacement prompt: {error}")
+
+
+def build_reflection_lm(config: GEPAConfig) -> ReflectionLM:
     client = config.reflection_client or config.client
     judge = Judge(
         JudgeConfig(
@@ -26,28 +102,12 @@ def build_reflection_lm(config: GEPAConfig) -> Callable[[str], str]:
             timeout=client.timeout,
         )
     )
-
-    def reflection_lm(prompt: str) -> str:
-        started = time.perf_counter()
-        response = asyncio.run(judge.complete(prompt))
-        if config.save_results:
-            path = config.output_dir / config.run.dir / "reflection_metrics.jsonl"
-            with path.open("a", encoding="utf-8") as file:
-                file.write(
-                    json.dumps(
-                        {
-                            "seconds": time.perf_counter() - started,
-                            "response_text": response.text,
-                            "usage": response.usage.model_dump(mode="json")
-                            if response.usage
-                            else None,
-                        }
-                    )
-                    + "\n"
-                )
-        return response.text
-
-    return reflection_lm
+    path = (
+        config.output_dir / config.run.dir / "reflection_metrics.jsonl"
+        if config.save_results
+        else None
+    )
+    return ReflectionLM(judge, path)
 
 
 EFFICIENCY_REFLECTION_TEMPLATE = """Write a compact replacement task system prompt.

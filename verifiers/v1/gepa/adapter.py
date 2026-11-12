@@ -79,6 +79,49 @@ class GEPAAdapter:
         aligned even when an output contains several rollouts. Called synchronously by GEPA on
         the main thread; each batch's rollouts run on the runner's persistent loop via
         `run_until_complete`."""
+        system_prompt, counts, episodes = self._prepare_evaluation(batch, candidate)
+        if episodes is None:
+            episodes = self.loop.run_until_complete(
+                self._run_batch(batch, system_prompt, counts)
+            )
+        return self._finish_evaluation(
+            episodes, batch, system_prompt, counts, capture_traces
+        )
+
+    def batch_evaluate(
+        self, items: list[tuple[Candidate, list[int]]]
+    ) -> list[EvaluationBatch[Trajectory, Trajectory]]:
+        """Schedule proposal/validation batches together under the shared semaphore."""
+        return self.loop.run_until_complete(self._evaluate_many(items))
+
+    async def _evaluate_many(
+        self, items: list[tuple[Candidate, list[int]]]
+    ) -> list[EvaluationBatch[Trajectory, Trajectory]]:
+        jobs = [
+            asyncio.create_task(self._evaluate_async(batch, candidate, True))
+            for candidate, batch in items
+        ]
+        try:
+            return list(await asyncio.gather(*jobs))
+        except BaseException:
+            for job in jobs:
+                job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
+            raise
+
+    async def _evaluate_async(
+        self, batch: list[int], candidate: Candidate, capture_traces: bool
+    ) -> EvaluationBatch[Trajectory, Trajectory]:
+        system_prompt, counts, episodes = self._prepare_evaluation(batch, candidate)
+        if episodes is None:
+            episodes = await self._run_batch(batch, system_prompt, counts)
+        return self._finish_evaluation(
+            episodes, batch, system_prompt, counts, capture_traces
+        )
+
+    def _prepare_evaluation(
+        self, batch: list[int], candidate: Candidate
+    ) -> tuple[str, list[int], list[Episode] | None]:
         system_prompt = candidate.get("system_prompt", "")
         counts = [
             (self.group_size if self.gr_gepa else 1)
@@ -97,9 +140,17 @@ class GEPAAdapter:
                 for e in (item if isinstance(item, list) else [item])
             ]
         else:
-            episodes = self.loop.run_until_complete(
-                self._run_batch(batch, system_prompt, counts)
-            )
+            episodes = None
+        return system_prompt, counts, episodes
+
+    def _finish_evaluation(
+        self,
+        episodes: list[Episode],
+        batch: list[int],
+        system_prompt: str,
+        counts: list[int],
+        capture_traces: bool,
+    ) -> EvaluationBatch[Trajectory, Trajectory]:
         # Infrastructure failures must behave identically in every scoring mode.
         for episode in episodes:
             _episode_score(episode)
@@ -145,7 +196,7 @@ class GEPAAdapter:
         for task_idx, n in zip(batch, counts):
             group = episodes[offset : offset + n]
             offset += n
-            if task_idx not in self.train_task_ids and n > 1:
+            if task_idx not in self.train_task_ids:
                 accuracy = sum(_episode_score(e) for e in group) / n
                 tokens = sum(e.num_total_tokens for e in group) / n
                 seconds = (
@@ -161,10 +212,10 @@ class GEPAAdapter:
                             1
                             + self.count_prompt_tokens(system_prompt) / scales["prompt"]
                         )
-                        + 0.075 / (1 + tokens / scales["tokens"])
-                        + 0.075 / (1 + seconds / scales["agent_seconds"])
+                        + 0.1 / (1 + tokens / scales["tokens"])
+                        + 0.05 / (1 + seconds / scales["agent_seconds"])
                     )
-                outputs.append(group)
+                outputs.append(group if n > 1 else group[0])
                 scores.append(value)
                 if self.evaluation_metrics_path is not None:
                     record = {
@@ -268,8 +319,8 @@ class GEPAAdapter:
         return reward * (
             0.8
             + 0.05 / (1 + prompt / self.efficiency_scales["prompt"])
-            + 0.075 / (1 + tokens / self.efficiency_scales["tokens"])
-            + 0.075 / (1 + seconds / self.efficiency_scales["agent_seconds"])
+            + 0.1 / (1 + tokens / self.efficiency_scales["tokens"])
+            + 0.05 / (1 + seconds / self.efficiency_scales["agent_seconds"])
         )
 
     async def _run_batch(
@@ -284,13 +335,19 @@ class GEPAAdapter:
             for task, n in zip(tasks, counts, strict=True)
             for slot in self.env.slots(task, n=n)
         ]
-        results = await asyncio.gather(
-            *(
+        jobs = [
+            asyncio.create_task(
                 self.env.run_slot(slot, self.ctx, self.semaphore, self.on_complete)
-                for slot in slots
             )
-        )
-        return list(results)
+            for slot in slots
+        ]
+        try:
+            return list(await asyncio.gather(*jobs))
+        except BaseException:
+            for job in jobs:
+                job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
+            raise
 
     def make_reflective_dataset(
         self,
@@ -503,8 +560,8 @@ def _group_scores(
 EFFICIENCY_GUIDANCE = (
     "Compare repeated rollouts of the same task under the same parent prompt. "
     "Revise only the evolvable task system prompt. Maximize the weighted score: "
-    "correctness 80%, prompt-token efficiency 5%, episode total-token efficiency 7.5%, "
-    "and agent-time efficiency 7.5%. Efficiency bonuses apply only to correct rollouts. "
+    "correctness 80%, prompt-token efficiency 5%, episode total-token efficiency 10%, "
+    "and agent-time efficiency 5%. Efficiency bonuses apply only to correct rollouts. "
     "Each efficiency term is 1/(1+cost/frozen_seed_scale); compare absolute costs, not "
     "candidate-specific min-max scores. Seek the shortest sufficient prompt. Remove "
     "redundant instructions, task-specific facts, worked examples, and repeated tool "

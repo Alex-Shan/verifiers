@@ -83,9 +83,9 @@ class GEPAConfig(BaseConfig):
     efficiency_calibration_path: Path | None = None
     """Shared frozen scales for efficiency arms with the same seed and setup."""
     efficiency_objective: bool = False
-    """Use fixed 80/5/7.5/7.5 correctness/prompt/tokens/time scoring and compact reflection."""
-    gr_gepa: bool = False
-    """Compare repeated rollouts of each training task under the same candidate prompt."""
+    """Use fixed 80/5/10/5 correctness/prompt/tokens/time scoring and compact reflection."""
+    gr_gepa: bool = Field(False, validation_alias=AliasChoices("gm_gepa", "gr_gepa"))
+    """Compare repeated rollouts; gm_gepa is the public alias, gr_gepa remains compatible."""
     group_size: int = Field(4, ge=2)
     """Rollouts per training task when GR-GEPA is enabled. Validation uses validation_rollouts."""
     group_alpha: float = Field(0.9, ge=0, le=1)
