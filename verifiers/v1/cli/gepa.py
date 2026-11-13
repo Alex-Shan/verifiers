@@ -8,6 +8,7 @@ leading bare token is the taskset id, the `env` subconfig is narrowed from the i
 and the actual parse is `pydantic_config.cli`.
 """
 
+import fcntl
 import os
 import shutil
 import sys
@@ -75,6 +76,14 @@ def main(argv: list[str] | None = None) -> None:
             "multiple agent roles; GEPA optimizes one shared system prompt"
         )
     run_path = output_path(config)
+    run_path.parent.mkdir(parents=True, exist_ok=True)
+    run_lock = (run_path.parent / ("." + run_path.name + ".lock")).open("a")
+    try:
+        fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("This experiment already has an active process") from None
+    if config.resume and (config.clean or config.dry_run):
+        raise SystemExit("resume cannot be combined with clean or dry-run")
     if config.clean and run_path.exists():
         output_dir = config.output_dir.resolve()
         resolved_run_path = run_path.resolve()
@@ -87,7 +96,7 @@ def main(argv: list[str] | None = None) -> None:
     # config included, which would destroy the existing traces' config provenance —
     # would overwrite the previous run.
     traces_file = run_path / TRACES_FILE
-    if traces_file.exists() and traces_file.stat().st_size > 0:
+    if not config.resume and traces_file.exists() and traces_file.stat().st_size > 0:
         raise SystemExit(
             f"run directory {run_path} already contains results - "
             "pick another --run.name or delete it"

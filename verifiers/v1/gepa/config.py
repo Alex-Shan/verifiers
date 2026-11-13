@@ -8,6 +8,7 @@ reflection model, train/val split, budget). GEPA always runs in-process, since i
 `GEPAAdapter`)."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SerializeAsAny, model_validator
 from pydantic_config import BaseConfig
@@ -38,6 +39,9 @@ class GEPAConfig(BaseConfig):
     run: RunConfig = Field(default_factory=RunConfig)
     """Run identity: `run.name` is the display name and `run.dir` names the directory
     under `output_dir`; both auto-generate like an eval's when unset."""
+    resume: bool = False
+    """Resume a run with durable recovery records."""
+
     model: str = Field(
         "deepseek/deepseek-v4-flash", validation_alias=AliasChoices("model", "m")
     )
@@ -82,6 +86,8 @@ class GEPAConfig(BaseConfig):
     """Train tasks sampled per reflection step."""
     efficiency_calibration_path: Path | None = None
     """Shared frozen scales for efficiency arms with the same seed and setup."""
+    efficiency_protocol: Literal["legacy", "token_v1"] = "legacy"
+    efficiency_feedback: bool | None = None
     efficiency_objective: bool = False
     """Use fixed 80/5/10/5 correctness/prompt/tokens/time scoring and compact reflection."""
     gr_gepa: bool = Field(False, validation_alias=AliasChoices("gm_gepa", "gr_gepa"))

@@ -11,6 +11,7 @@ thread, so a Ctrl-C unwinds straight through `optimize()` into the runner's tear
 import asyncio
 import hashlib
 import json
+import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,10 +40,39 @@ class GEPAAdapter:
     loop (which holds `env.serving()` open); `evaluate` drives its rollouts on it with
     `run_until_complete`."""
 
+    def get_adapter_state(self):
+        return {
+            "recovery_version": 3,
+            "evaluation_cursor": self.evaluation_cursor,
+            "sampler": self.sampler.__dict__ if self.sampler else {},
+            "teacher_cursor": getattr(self.teacher, "cursor", 0),
+        }
+
+    def set_adapter_state(self, state):
+        if not state:
+            return
+        if state.get("recovery_version") != 3 or not all(
+            k in state for k in ("evaluation_cursor", "sampler", "teacher_cursor")
+        ):
+            raise ValueError("Incomplete or unsupported recovery state")
+        self.evaluation_cursor = state["evaluation_cursor"]
+        if self.sampler and state.get("sampler"):
+            saved = dict(state["sampler"])
+            self.sampler.rng.setstate(saved.pop("rng").getstate())
+            self.sampler.__dict__.update(saved)
+        if self.teacher:
+            self.teacher.cursor = state.get("teacher_cursor", 0)
+
     env: Env
     ctx: ModelContext
     tasks: dict[int, Task]
     loop: asyncio.AbstractEventLoop
+    recovery_dir: Path | None = None
+    evaluation_cursor: int = 0
+    initial_validation_pending: bool = True
+    sampler: Any = None
+    teacher: Any = None
+
     train_task_ids: set[int] = field(default_factory=set)
     semaphore: asyncio.Semaphore | None = None
     on_complete: Callable[[Episode], Awaitable[None]] | None = None
@@ -55,6 +85,8 @@ class GEPAAdapter:
     undeclared silently disables all mutation proposals)."""
     reflective_dataset_path: Path | None = None
     system_prompt_prefix: str = ""
+    efficiency_protocol: str = "legacy"
+    efficiency_feedback: bool | None = None
     efficiency_objective: bool = False
     count_prompt_tokens: Callable[[str], int] | None = None
     efficiency_scales: dict[str, float] = field(default_factory=dict)
@@ -79,10 +111,14 @@ class GEPAAdapter:
         aligned even when an output contains several rollouts. Called synchronously by GEPA on
         the main thread; each batch's rollouts run on the runner's persistent loop via
         `run_until_complete`."""
+        phase = (
+            "initial_validation" if self.initial_validation_pending else "optimization"
+        )
+        self.initial_validation_pending = False
         system_prompt, counts, episodes = self._prepare_evaluation(batch, candidate)
         if episodes is None:
             episodes = self.loop.run_until_complete(
-                self._run_batch(batch, system_prompt, counts)
+                self._run_batch(batch, system_prompt, counts, phase=phase)
             )
         return self._finish_evaluation(
             episodes, batch, system_prompt, counts, capture_traces
@@ -129,9 +165,13 @@ class GEPAAdapter:
             else self.validation_rollouts
             for idx in batch
         ]
-        if system_prompt == self.calibration_prompt and all(
-            idx in self.calibration_cache and n == self.validation_rollouts
-            for idx, n in zip(batch, counts)
+        if (
+            self.recovery_dir is None
+            and system_prompt == self.calibration_prompt
+            and all(
+                idx in self.calibration_cache and n == self.validation_rollouts
+                for idx, n in zip(batch, counts)
+            )
         ):
             cached = [self.calibration_cache.pop(idx) for idx in batch]
             episodes = [
@@ -156,13 +196,14 @@ class GEPAAdapter:
             _episode_score(episode)
         if self.evaluation_metrics_path is not None:
             prompt_id = hashlib.sha256(system_prompt.encode()).hexdigest()
-            with self.evaluation_metrics_path.open("a", encoding="utf-8") as file:
+            with self.evaluation_metrics_path.open("a", encoding="utf-8"):
                 sample_counts = {}
                 for episode in episodes:
                     task_id = episode.task.data.idx
                     sample_counts[task_id] = sample_counts.get(task_id, 0) + 1
                     usage = getattr(episode, "usage", None)
                     row = {
+                        "record_id": episode.id,
                         "prompt_id": prompt_id,
                         "system_prompt": system_prompt,
                         "task_idx": episode.task.data.idx,
@@ -189,7 +230,7 @@ class GEPAAdapter:
                             if self.system_prompt_prefix
                             else None
                         )
-                    file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    _append_unique(self.evaluation_metrics_path, row)
         outputs: list[Trajectory] = []
         scores: list[float] = []
         offset = 0
@@ -204,21 +245,17 @@ class GEPAAdapter:
                 )
                 value = accuracy
                 if self.efficiency_objective:
-                    scales = self.efficiency_scales
-                    value *= (
-                        0.8
-                        + 0.05
-                        / (
-                            1
-                            + self.count_prompt_tokens(system_prompt) / scales["prompt"]
-                        )
-                        + 0.1 / (1 + tokens / scales["tokens"])
-                        + 0.05 / (1 + seconds / scales["agent_seconds"])
+                    value = self.cost_score(
+                        accuracy,
+                        self.count_prompt_tokens(system_prompt),
+                        tokens,
+                        seconds,
                     )
                 outputs.append(group if n > 1 else group[0])
                 scores.append(value)
                 if self.evaluation_metrics_path is not None:
                     record = {
+                        "record_id": ":".join(e.id for e in group),
                         "prompt_id": hashlib.sha256(system_prompt.encode()).hexdigest(),
                         "task_idx": task_idx,
                         "n": n,
@@ -235,10 +272,12 @@ class GEPAAdapter:
                         if self.count_prompt_tokens
                         else None,
                     }
-                    with self.evaluation_metrics_path.with_name(
-                        "validation_metrics.jsonl"
-                    ).open("a") as file:
-                        file.write(json.dumps(record) + "\n")
+                    _append_unique(
+                        self.evaluation_metrics_path.with_name(
+                            "validation_metrics.jsonl"
+                        ),
+                        record,
+                    )
             elif self.efficiency_objective:
                 outputs.append(group if n > 1 else group[0])
                 scores.append(
@@ -269,11 +308,17 @@ class GEPAAdapter:
 
     def calibrate(self, batch: list[int], system_prompt: str) -> None:
         """Freeze seed-validation scales and reuse these episodes in GEPA's initial eval."""
-        if not self.efficiency_objective or self.count_prompt_tokens is None:
+        if (
+            not (self.efficiency_objective or self.cost_feedback)
+            or self.count_prompt_tokens is None
+        ):
             raise ValueError("Efficiency calibration requires a prompt tokenizer")
         episodes = self.loop.run_until_complete(
             self._run_batch(
-                batch, system_prompt, [self.validation_rollouts] * len(batch)
+                batch,
+                system_prompt,
+                [self.validation_rollouts] * len(batch),
+                phase="calibration",
             )
         )
         for episode in episodes:
@@ -289,14 +334,18 @@ class GEPAAdapter:
             for g in groups
         ]
         times = [t for t in times if t > 0]
-        if not lengths or not times:
+        if not lengths or (self.efficiency_protocol == "legacy" and not times):
             raise ValueError(
                 "Calibration requires positive token and agent-time measurements"
             )
         self.efficiency_scales = {
             "prompt": max(1, self.count_prompt_tokens(system_prompt)),
             "tokens": median(lengths),
-            "agent_seconds": median(times),
+            **(
+                {"agent_seconds": median(times)}
+                if self.efficiency_protocol == "legacy"
+                else {}
+            ),
         }
         self.calibration_prompt = system_prompt
         self.calibration_cache = dict(
@@ -316,16 +365,42 @@ class GEPAAdapter:
         prompt = self.count_prompt_tokens(system_prompt)
         tokens = episode.num_total_tokens
         seconds = _episode_timing(episode)["agent"]["duration"]
+        return self.cost_score(reward, prompt, tokens, seconds)
+
+    @property
+    def cost_feedback(self) -> bool:
+        return (
+            self.efficiency_objective
+            if self.efficiency_feedback is None
+            else self.efficiency_feedback
+        )
+
+    def cost_score(
+        self, reward: float, prompt: float, tokens: float, seconds: float
+    ) -> float:
+        scales = self.efficiency_scales
+        if self.efficiency_protocol == "token_v1":
+            return reward * (
+                0.8
+                + 0.05 / (1 + prompt / scales["prompt"])
+                + 0.15 / (1 + tokens / scales["tokens"])
+            )
         return reward * (
             0.8
-            + 0.05 / (1 + prompt / self.efficiency_scales["prompt"])
-            + 0.1 / (1 + tokens / self.efficiency_scales["tokens"])
-            + 0.05 / (1 + seconds / self.efficiency_scales["agent_seconds"])
+            + 0.05 / (1 + prompt / scales["prompt"])
+            + 0.1 / (1 + tokens / scales["tokens"])
+            + 0.05 / (1 + seconds / scales["agent_seconds"])
         )
 
     async def _run_batch(
-        self, batch: list[int], system_prompt: str, counts: list[int]
+        self,
+        batch: list[int],
+        system_prompt: str,
+        counts: list[int],
+        phase: str = "optimization",
     ) -> list[Episode]:
+        import cloudpickle
+
         # Inject the candidate as a copy of each base task with its system_prompt overridden
         # (`with_system_prompt` copies rather than reconstructs, so subclass state survives and
         # the shared base task in `self.tasks` is left untouched for the next candidate).
@@ -335,11 +410,53 @@ class GEPAAdapter:
             for task, n in zip(tasks, counts, strict=True)
             for slot in self.env.slots(task, n=n)
         ]
-        jobs = [
-            asyncio.create_task(
-                self.env.run_slot(slot, self.ctx, self.semaphore, self.on_complete)
+        call = self.evaluation_cursor if phase == "optimization" else 0
+        if phase == "optimization":
+            self.evaluation_cursor += 1
+
+        async def run_one(index, slot):
+            path = (
+                self.recovery_dir / phase / f"{call}-{index}.bin"
+                if self.recovery_dir
+                else None
             )
-            for slot in slots
+            identity = (system_prompt, batch, counts, index, phase)
+
+            def persist(episode):
+                if path:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = path.with_suffix(".tmp")
+                    with temporary.open("wb") as stream:
+                        stream.write(cloudpickle.dumps((identity, episode)))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    temporary.replace(path)
+
+            if path and phase == "initial_validation" and not path.exists():
+                source = self.recovery_dir / "calibration" / f"0-{index}.bin"
+                if source.exists():
+                    old_identity, cached = cloudpickle.loads(source.read_bytes())
+                    if old_identity != (*identity[:-1], "calibration"):
+                        raise ValueError("Calibration seed alias identity mismatch")
+                    persist(cached)
+            if path and path.exists():
+                saved_identity, episode = cloudpickle.loads(path.read_bytes())
+                if saved_identity != identity:
+                    raise ValueError(
+                        "Recovery evaluation identity mismatch; refusing to rerun"
+                    )
+                return episode
+
+            async def complete(episode):
+                persist(episode)
+                if self.on_complete:
+                    await self.on_complete(episode)
+
+            return await self.env.run_slot(slot, self.ctx, self.semaphore, complete)
+
+        jobs = [
+            asyncio.create_task(run_one(index, slot))
+            for index, slot in enumerate(slots)
         ]
         try:
             return list(await asyncio.gather(*jobs))
@@ -359,7 +476,7 @@ class GEPAAdapter:
         trajectories = eval_batch.trajectories or []
         records: list[dict[str, Any]] = []
         for trajectory in trajectories:
-            if isinstance(trajectory, list) or self.efficiency_objective:
+            if isinstance(trajectory, list) or self.cost_feedback:
                 trajectory = (
                     trajectory if isinstance(trajectory, list) else [trajectory]
                 )
@@ -368,7 +485,7 @@ class GEPAAdapter:
                         self.efficiency_score(e, candidate.get("system_prompt", ""))
                         for e in trajectory
                     ]
-                    if self.efficiency_objective
+                    if self.cost_feedback
                     else _group_scores(
                         trajectory,
                         self.group_alpha,
@@ -414,8 +531,12 @@ class GEPAAdapter:
                             > 1,
                         },
                         "comparison_guidance": (
-                            EFFICIENCY_GUIDANCE
-                            if self.efficiency_objective
+                            (
+                                TOKEN_GUIDANCE
+                                if self.efficiency_protocol == "token_v1"
+                                else EFFICIENCY_GUIDANCE
+                            )
+                            if self.cost_feedback
                             else "Compare repeated rollouts of the same task. Diagnose recurring errors; "
                             "score combines success and within-group relative tokens and agent time. "
                             "Propose a generalizable prompt revision."
@@ -576,3 +697,28 @@ EFFICIENCY_GUIDANCE = (
     "Do not infer improvement from timing alone or overfit to one stochastic rollout. "
     "Return a compact, generalizable replacement prompt."
 )
+
+TOKEN_GUIDANCE = (
+    "Optimize correctness first, prompt sufficiency, and episode token efficiency. "
+    "Diagnostic utility is reward*(0.8+0.05/(1+P/P0)+0.15/(1+N/N0)), with frozen seed scales. "
+    "N is episode num_total_tokens, not final answer length or provider billed tokens. "
+    "Each task has one sample: do not claim same-task outcome or cost comparisons. "
+    "Identify actionable edits and their expected benefits and costs. Remove redundant "
+    "instructions, repeated tool documentation, unnecessary enumeration and repeated solving. "
+    "Prefer an appropriate solver for numerical optimization, inspect solver status and "
+    "verify feasibility and the requested result. Allow small enumeration for useful checks; "
+    "formulation and derivation tasks need not invoke tools. Do not reward tool avoidance. "
+    "Preserve necessary verification. Do not optimize timing; it is diagnostic only. "
+    "Return one generalizable replacement prompt, without task-specific facts."
+)
+
+
+def _append_unique(path, row):
+    existing = set()
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if line.strip():
+                existing.add(json.loads(line).get("record_id"))
+    if row["record_id"] not in existing:
+        with path.open("a") as stream:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")

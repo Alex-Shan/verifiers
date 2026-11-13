@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import random
+from uuid import uuid4
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
@@ -31,6 +32,7 @@ from verifiers.v1.gepa.dataset import (
 )
 from verifiers.v1.gepa.reflection import (
     EFFICIENCY_REFLECTION_TEMPLATE,
+    TOKEN_REFLECTION_TEMPLATE,
     build_reflection_lm,
 )
 from verifiers.v1.utils.logging import get_logger
@@ -131,6 +133,23 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
         wandb_dir.mkdir(parents=True, exist_ok=True)
 
     if run_dir is not None:
+        import json as recovery_json
+
+        identity = config.model_dump(mode="json")
+        identity.pop("resume", None)
+        manifest = run_dir / "recovery_identity.json"
+        if config.resume:
+            if (
+                not manifest.exists()
+                or recovery_json.loads(manifest.read_text()) != identity
+            ):
+                raise ValueError("Recovery identity missing or mismatched")
+        elif manifest.exists() or (run_dir / "gepa_state.bin").exists():
+            raise ValueError("Run already exists; use resume or a new run name")
+        else:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(recovery_json.dumps(identity, indent=2))
+    if run_dir is not None and not config.resume:
         save_config(
             config, run_dir, "gepa.json"
         )  # resolved config + a fresh traces.jsonl
@@ -176,6 +195,8 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 on_complete=on_complete,
                 reflection_columns=config.reflection_columns,
                 reflective_dataset_path=reflective_dataset_path,
+                efficiency_protocol=config.efficiency_protocol,
+                efficiency_feedback=config.efficiency_feedback,
                 efficiency_objective=config.efficiency_objective,
                 evaluation_metrics_path=run_dir / "evaluation_metrics.jsonl"
                 if run_dir
@@ -187,6 +208,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 group_time_weight=config.group_time_weight,
                 group_success_threshold=config.group_success_threshold,
             )
+            adapter.recovery_dir = run_dir / "recovery" if run_dir else None
             from verifiers.v1.harnesses.hero_python.harness import (
                 HeroPythonHarnessConfig,
             )
@@ -198,7 +220,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 if getattr(config.env, "agent", None)
                 else False
             )
-            if config.efficiency_objective or hero_python:
+            if config.efficiency_objective or adapter.cost_feedback or hero_python:
                 from transformers import AutoTokenizer
 
                 tokenizer = AutoTokenizer.from_pretrained(
@@ -213,7 +235,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 )
 
                 adapter.system_prompt_prefix = HERO_PYTHON_SYSTEM_PROMPT
-            if config.efficiency_objective:
+            if config.efficiency_objective or adapter.cost_feedback:
                 calibration_path = config.efficiency_calibration_path
                 identity = {
                     "model": config.model,
@@ -225,6 +247,8 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                         repr([(t.data.idx, t.data.prompt) for t in val_tasks]).encode()
                     ).hexdigest(),
                 }
+                if config.efficiency_protocol != "legacy":
+                    identity["efficiency_protocol"] = config.efficiency_protocol
                 identity["validation_rollouts"] = config.validation_rollouts
                 identity["validation_protocol"] = "mean-pass1-v2"
                 identity["effective_env"] = config.env.model_dump(mode="json")
@@ -236,11 +260,10 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                                 "Shared calibration does not match this experiment setup"
                             )
                         adapter.efficiency_scales = calibration["scales"]
-                        if set(adapter.efficiency_scales) != {
-                            "prompt",
-                            "tokens",
-                            "agent_seconds",
-                        } or any(
+                        expected_scales = {"prompt", "tokens"}
+                        if config.efficiency_protocol == "legacy":
+                            expected_scales.add("agent_seconds")
+                        if set(adapter.efficiency_scales) != expected_scales or any(
                             not isinstance(v, (int, float)) or not 0 < v < float("inf")
                             for v in adapter.efficiency_scales.values()
                         ):
@@ -275,7 +298,18 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                         json.dumps(adapter.efficiency_scales, indent=2),
                         encoding="utf-8",
                     )
+            sampler = CursorEpochShuffledBatchSampler(
+                config.reflection_minibatch_size, rng=random.Random(config.seed)
+            )
+            adapter.sampler = sampler
+            adapter.teacher = reflection_lm
+            adapter.recovery_dir = run_dir / "recovery" if run_dir else None
+            from gepa.strategies.candidate_selector import ParetoCandidateSelector
+
             optimize_kwargs: dict = {
+                "candidate_selection_strategy": ParetoCandidateSelector(
+                    rng=sampler.rng
+                ),
                 "seed_candidate": {"system_prompt": seed_prompt},
                 "trainset": [task.data.idx for task in train_tasks],
                 "valset": [task.data.idx for task in val_tasks],
@@ -283,18 +317,20 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 "reflection_lm": reflection_lm,
                 # GEPA requires this to be None when passing a custom sampler.
                 "reflection_minibatch_size": None,
-                "batch_sampler": CursorEpochShuffledBatchSampler(
-                    config.reflection_minibatch_size, rng=random.Random(config.seed)
-                ),
+                "batch_sampler": sampler,
                 "sampling_strategy": PxNSampling(p=2, n=2),
                 "run_dir": str(run_dir) if run_dir is not None else None,
                 "seed": config.seed,
                 "display_progress_bar": False,
-                "skip_perfect_score": not config.efficiency_objective,
+                "skip_perfect_score": False
+                if config.efficiency_protocol == "token_v1"
+                else not config.efficiency_objective,
                 "perfect_score": 1.0,
                 "logger": _GEPALog(),
                 "use_wandb": config.use_wandb,
                 "wandb_init_kwargs": {
+                    "id": uuid4().hex,
+                    "resume": "never",
                     "project": config.wandb_project,
                     "name": config.run.name,
                     "dir": str(wandb_dir) if wandb_dir is not None else None,
@@ -310,12 +346,17 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                         "max_iterations": config.max_iterations,
                         "max_iterations_without_improvement": config.max_iterations_without_improvement,
                         "seed": config.seed,
+                        "efficiency_protocol": config.efficiency_protocol,
+                        "efficiency_objective": config.efficiency_objective,
+                        "efficiency_feedback": adapter.cost_feedback,
                     },
                 },
             }
-            if config.efficiency_objective:
+            if adapter.cost_feedback:
                 optimize_kwargs["reflection_prompt_template"] = (
-                    EFFICIENCY_REFLECTION_TEMPLATE
+                    TOKEN_REFLECTION_TEMPLATE
+                    if config.efficiency_protocol == "token_v1"
+                    else EFFICIENCY_REFLECTION_TEMPLATE
                 )
             optimize_kwargs.update(_stopping_kwargs(config))
             result = optimize(**optimize_kwargs)
