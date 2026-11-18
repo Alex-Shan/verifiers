@@ -99,6 +99,7 @@ class GEPAAdapter:
     calibration_prompt: str | None = None
     calibration_cache: dict[int, Episode | list[Episode]] = field(default_factory=dict)
     evaluation_metrics_path: Path | None = None
+    standard_gepa: bool = False
     validation_rollouts: int = 1
     gr_gepa: bool = False
     group_size: int = 4
@@ -621,14 +622,21 @@ class GEPAAdapter:
         records = []
         for trace in episode.traces:
             record: dict[str, Any] = {
-                "query": to_jsonable_python(trace.task.data.prompt),
-                "completion": [
-                    to_jsonable_python(node.message) for node in trace.nodes
-                ],
                 "reward": trace.reward,
                 "agent": trace.agent.name,
-                "timing": _trace_timing(trace),
             }
+            if self.standard_gepa:
+                record.update(
+                    query=trace.task.data.prompt_text, completion=trace.last_reply
+                )
+            else:
+                record.update(
+                    query=to_jsonable_python(trace.task.data.prompt),
+                    completion=[
+                        to_jsonable_python(node.message) for node in trace.nodes
+                    ],
+                    timing=_trace_timing(trace),
+                )
             if trace.has_error:
                 record["error"] = str(trace.last_error)
             if trace.stop_condition:

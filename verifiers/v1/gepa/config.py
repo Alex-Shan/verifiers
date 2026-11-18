@@ -57,10 +57,10 @@ class GEPAConfig(BaseConfig):
     """Which of the taskset's tasks GEPA splits into train/val, under `--select.*`
     (`-n` sets `select.limit`, `-s` sets `select.shuffle`)."""
     train_tasks: Path | None = None
-    """Optional JSONL file used as the full training set. Set together with
+    """Optional JSONL file or glob used as the full training set. Set together with
     `val_tasks`; the taskset config must expose a `data_path` field."""
     val_tasks: Path | None = None
-    """Optional JSONL file used as the full validation set. Set together with
+    """Optional JSONL file or glob used as the full validation set. Set together with
     `train_tasks`; the taskset config must expose a `data_path` field."""
     shuffle: bool | None = Field(None, exclude=True)
     """Legacy top-level alias for `select.shuffle`."""
@@ -84,6 +84,8 @@ class GEPAConfig(BaseConfig):
     """Stop after this many iterations without a better validation score."""
     reflection_minibatch_size: int = 3
     """Train tasks sampled per reflection step."""
+    standard_gepa: bool = False
+    """Use GEPA's native minibatch, reflection and acceptance rules with 2×2 proposals."""
     efficiency_calibration_path: Path | None = None
     """Shared frozen scales for efficiency arms with the same seed and setup."""
     efficiency_protocol: Literal["legacy", "token_v1"] = "legacy"
@@ -135,6 +137,18 @@ class GEPAConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_stop_and_setup_run_name(self):
+        if self.standard_gepa and (
+            self.efficiency_protocol != "legacy"
+            or self.efficiency_objective
+            or self.efficiency_feedback
+            or self.gr_gepa
+            or self.correctness_first
+            or self.validate_all_proposals
+            or self.validation_rollouts != 1
+        ):
+            raise ValueError(
+                "Standard GEPA requires raw rewards and one rollout per task"
+            )
         if self.correctness_first and (self.efficiency_objective or self.gr_gepa):
             raise ValueError("correctness_first requires raw correctness scores")
         if self.shuffle is not None:

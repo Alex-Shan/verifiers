@@ -137,6 +137,8 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
 
         identity = config.model_dump(mode="json")
         identity.pop("resume", None)
+        if not config.standard_gepa:
+            identity.pop("standard_gepa", None)
         manifest = run_dir / "recovery_identity.json"
         if config.resume:
             if (
@@ -219,6 +221,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 evaluation_metrics_path=run_dir / "evaluation_metrics.jsonl"
                 if run_dir
                 else None,
+                standard_gepa=config.standard_gepa,
                 validation_rollouts=config.validation_rollouts,
                 gr_gepa=config.gr_gepa,
                 group_size=config.group_size,
@@ -238,7 +241,11 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 if getattr(config.env, "agent", None)
                 else False
             )
-            if config.efficiency_objective or adapter.cost_feedback or hero_python:
+            if (
+                config.efficiency_objective
+                or adapter.cost_feedback
+                or (hero_python and not config.standard_gepa)
+            ):
                 from transformers import AutoTokenizer
 
                 tokenizer = AutoTokenizer.from_pretrained(
@@ -316,27 +323,18 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                         json.dumps(adapter.efficiency_scales, indent=2),
                         encoding="utf-8",
                     )
-            sampler = CursorEpochShuffledBatchSampler(
-                config.reflection_minibatch_size, rng=random.Random(config.seed)
-            )
-            adapter.sampler = sampler
             adapter.teacher = reflection_lm
             adapter.recovery_dir = run_dir / "recovery" if run_dir else None
             from gepa.strategies.candidate_selector import ParetoCandidateSelector
 
             optimize_kwargs: dict = {
-                "candidate_selection_strategy": ParetoCandidateSelector(
-                    rng=random.Random(config.seed)
-                ),
+                "sampling_strategy": PxNSampling(p=2, n=2),
                 "seed_candidate": {"system_prompt": seed_prompt},
                 "trainset": [task.data.idx for task in train_tasks],
                 "valset": [task.data.idx for task in val_tasks],
                 "adapter": adapter,
                 "reflection_lm": reflection_lm,
-                # GEPA requires this to be None when passing a custom sampler.
-                "reflection_minibatch_size": None,
-                "batch_sampler": sampler,
-                "sampling_strategy": PxNSampling(p=2, n=2),
+                "reflection_minibatch_size": config.reflection_minibatch_size,
                 "run_dir": str(run_dir) if run_dir is not None else None,
                 "seed": config.seed,
                 "display_progress_bar": False,
@@ -358,7 +356,9 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                         "num_val": len(val_tasks),
                         "proposal_parents": 2,
                         "mutations_per_parent": 2,
-                        "batch_sampler": "cursor_epoch_shuffled",
+                        "batch_sampler": "epoch_shuffled"
+                        if config.standard_gepa
+                        else "cursor_epoch_shuffled",
                         "reflection_minibatch_size": config.reflection_minibatch_size,
                         "max_total_rollouts": config.max_total_rollouts,
                         "max_iterations": config.max_iterations,
@@ -376,6 +376,18 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 ValidateAllProposals,
             )
 
+            if not config.standard_gepa:
+                sampler = CursorEpochShuffledBatchSampler(
+                    config.reflection_minibatch_size, rng=random.Random(config.seed)
+                )
+                adapter.sampler = sampler
+                optimize_kwargs.update(
+                    candidate_selection_strategy=ParetoCandidateSelector(
+                        rng=random.Random(config.seed)
+                    ),
+                    reflection_minibatch_size=None,
+                    batch_sampler=sampler,
+                )
             if config.correctness_first:
                 optimize_kwargs["acceptance_criterion"] = CorrectnessFirstAcceptance()
                 optimize_kwargs["val_evaluation_policy"] = CorrectnessFirstEvaluation(

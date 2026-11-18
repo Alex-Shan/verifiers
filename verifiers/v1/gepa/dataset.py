@@ -6,6 +6,7 @@ individual tasksets define ad hoc ones inconsistently), so GEPA carves one out o
 disjoint slices.
 """
 
+from glob import has_magic, iglob
 from pathlib import Path
 
 from verifiers.v1.configs.select import SelectConfig
@@ -26,7 +27,10 @@ def load_tasks_from_path(
         raise ValueError(
             "train_tasks/val_tasks require a taskset config with a `data_path` field"
         )
-    if not path.is_file():
+    if not path.is_file() and not (
+        has_magic(str(path))
+        and any(Path(match).is_file() for match in iglob(str(path), recursive=True))
+    ):
         raise FileNotFoundError(f"GEPA dataset file not found: {path.resolve()}")
 
     config = taskset.config.model_copy(update={"data_path": str(path)})
