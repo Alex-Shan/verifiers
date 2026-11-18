@@ -88,6 +88,9 @@ class GEPAConfig(BaseConfig):
     """Shared frozen scales for efficiency arms with the same seed and setup."""
     efficiency_protocol: Literal["legacy", "token_v1"] = "legacy"
     efficiency_feedback: bool | None = None
+    initial_evaluation_cache: Path | None = None
+    correctness_first: bool = False
+    validate_all_proposals: bool = False
     efficiency_objective: bool = False
     """Use fixed 80/5/10/5 correctness/prompt/tokens/time scoring and compact reflection."""
     gr_gepa: bool = Field(False, validation_alias=AliasChoices("gm_gepa", "gr_gepa"))
@@ -132,6 +135,8 @@ class GEPAConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_stop_and_setup_run_name(self):
+        if self.correctness_first and (self.efficiency_objective or self.gr_gepa):
+            raise ValueError("correctness_first requires raw correctness scores")
         if self.shuffle is not None:
             self.select = self.select.model_copy(update={"shuffle": self.shuffle})
         if (self.train_tasks is None) != (self.val_tasks is None):

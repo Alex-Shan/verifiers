@@ -70,6 +70,9 @@ class GEPAAdapter:
     recovery_dir: Path | None = None
     evaluation_cursor: int = 0
     initial_validation_pending: bool = True
+    paired_sampling_seed: int | None = None
+    initial_evaluation_cache: Path | None = None
+    initial_evaluation_identity: str = ""
     sampler: Any = None
     teacher: Any = None
 
@@ -90,6 +93,9 @@ class GEPAAdapter:
     efficiency_objective: bool = False
     count_prompt_tokens: Callable[[str], int] | None = None
     efficiency_scales: dict[str, float] = field(default_factory=dict)
+    validation_measurements: dict[str, tuple[float, float]] = field(
+        default_factory=dict
+    )
     calibration_prompt: str | None = None
     calibration_cache: dict[int, Episode | list[Episode]] = field(default_factory=dict)
     evaluation_metrics_path: Path | None = None
@@ -116,6 +122,8 @@ class GEPAAdapter:
         )
         self.initial_validation_pending = False
         system_prompt, counts, episodes = self._prepare_evaluation(batch, candidate)
+        if phase == "initial_validation" and self.initial_evaluation_cache:
+            episodes = self._shared_initial_episodes(batch, system_prompt, counts)
         if episodes is None:
             episodes = self.loop.run_until_complete(
                 self._run_batch(batch, system_prompt, counts, phase=phase)
@@ -299,12 +307,47 @@ class GEPAAdapter:
             else:
                 outputs.append(group[0])
                 scores.append(_episode_score(group[0]))
+        if batch and all(idx not in self.train_task_ids for idx in batch):
+            self.validation_measurements[system_prompt] = (
+                sum(_episode_score(e) for e in episodes),
+                sum(e.num_total_tokens for e in episodes) / len(episodes),
+            )
         return EvaluationBatch(
             outputs=outputs,
             scores=scores,
             trajectories=outputs if capture_traces else None,
             num_metric_calls=len(episodes),
         )
+
+    def _shared_initial_episodes(self, batch, system_prompt, counts):
+        import fcntl
+        import pickle
+
+        path = self.initial_evaluation_cache
+        identity = (self.initial_evaluation_identity, batch, system_prompt, counts)
+        if path is None:
+            return self.loop.run_until_complete(
+                self._run_batch(batch, system_prompt, counts, phase="calibration")
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if path.exists():
+                saved_identity, episodes = pickle.loads(path.read_bytes())
+                if saved_identity != identity:
+                    raise ValueError(
+                        "Shared initial evaluation does not match this setup"
+                    )
+                return episodes
+            episodes = self.loop.run_until_complete(
+                self._run_batch(batch, system_prompt, counts, phase="calibration")
+            )
+            for episode in episodes:
+                _episode_score(episode)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_bytes(pickle.dumps((identity, episodes)))
+            temporary.replace(path)
+            return episodes
 
     def calibrate(self, batch: list[int], system_prompt: str) -> None:
         """Freeze seed-validation scales and reuse these episodes in GEPA's initial eval."""
@@ -313,13 +356,8 @@ class GEPAAdapter:
             or self.count_prompt_tokens is None
         ):
             raise ValueError("Efficiency calibration requires a prompt tokenizer")
-        episodes = self.loop.run_until_complete(
-            self._run_batch(
-                batch,
-                system_prompt,
-                [self.validation_rollouts] * len(batch),
-                phase="calibration",
-            )
+        episodes = self._shared_initial_episodes(
+            batch, system_prompt, [self.validation_rollouts] * len(batch)
         )
         for episode in episodes:
             _episode_score(episode)
@@ -452,7 +490,26 @@ class GEPAAdapter:
                 if self.on_complete:
                     await self.on_complete(episode)
 
-            return await self.env.run_slot(slot, self.ctx, self.semaphore, complete)
+            ctx = self.ctx
+            if self.paired_sampling_seed is not None:
+                from dataclasses import replace
+
+                identities = [
+                    (idx, sample)
+                    for idx, n in zip(batch, counts)
+                    for sample in range(n)
+                ]
+                task_idx, sample = identities[index]
+                request_seed = int.from_bytes(
+                    hashlib.sha256(
+                        f"{self.paired_sampling_seed}:{task_idx}:{sample}".encode()
+                    ).digest()[:4],
+                    "big",
+                )
+                ctx = replace(
+                    ctx, sampling=ctx.sampling.model_copy(update={"seed": request_seed})
+                )
+            return await self.env.run_slot(slot, ctx, self.semaphore, complete)
 
         jobs = [
             asyncio.create_task(run_one(index, slot))

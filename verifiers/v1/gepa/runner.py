@@ -193,6 +193,24 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 train_task_ids={task.data.idx for task in train_tasks},
                 semaphore=semaphore,
                 on_complete=on_complete,
+                paired_sampling_seed=config.seed
+                if config.validate_all_proposals
+                else None,
+                initial_evaluation_cache=config.initial_evaluation_cache,
+                initial_evaluation_identity=hashlib.sha256(
+                    json.dumps(
+                        {
+                            "model": config.model,
+                            "sampling": config.sampling.model_dump(mode="json"),
+                            "env": config.env.model_dump(mode="json"),
+                            "seed": config.seed,
+                            "validation": [
+                                (t.data.idx, t.data.prompt) for t in val_tasks
+                            ],
+                        },
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest(),
                 reflection_columns=config.reflection_columns,
                 reflective_dataset_path=reflective_dataset_path,
                 efficiency_protocol=config.efficiency_protocol,
@@ -308,7 +326,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
 
             optimize_kwargs: dict = {
                 "candidate_selection_strategy": ParetoCandidateSelector(
-                    rng=sampler.rng
+                    rng=random.Random(config.seed)
                 ),
                 "seed_candidate": {"system_prompt": seed_prompt},
                 "trainset": [task.data.idx for task in train_tasks],
@@ -352,6 +370,23 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                     },
                 },
             }
+            from verifiers.v1.gepa.selection import (
+                CorrectnessFirstAcceptance,
+                CorrectnessFirstEvaluation,
+                ValidateAllProposals,
+            )
+
+            if config.correctness_first:
+                optimize_kwargs["acceptance_criterion"] = CorrectnessFirstAcceptance()
+                optimize_kwargs["val_evaluation_policy"] = CorrectnessFirstEvaluation(
+                    adapter
+                )
+            if config.validate_all_proposals:
+                optimize_kwargs["selection_strategy"] = ValidateAllProposals(
+                    adapter,
+                    [task.data.idx for task in val_tasks],
+                    run_dir / "selection_metrics.jsonl" if run_dir else None,
+                )
             if adapter.cost_feedback:
                 optimize_kwargs["reflection_prompt_template"] = (
                     TOKEN_REFLECTION_TEMPLATE
