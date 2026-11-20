@@ -622,21 +622,19 @@ class GEPAAdapter:
         records = []
         for trace in episode.traces:
             record: dict[str, Any] = {
+                "query": trace.task.data.prompt_text
+                if self.standard_gepa
+                else to_jsonable_python(trace.task.data.prompt),
+                # Keep every message in trace.nodes in order for GEPA reflection.
+                # Do not use trace.last_reply here: it drops tool calls and results.
+                "completion": [
+                    to_jsonable_python(node.message) for node in trace.nodes
+                ],
                 "reward": trace.reward,
                 "agent": trace.agent.name,
             }
-            if self.standard_gepa:
-                record.update(
-                    query=trace.task.data.prompt_text, completion=trace.last_reply
-                )
-            else:
-                record.update(
-                    query=to_jsonable_python(trace.task.data.prompt),
-                    completion=[
-                        to_jsonable_python(node.message) for node in trace.nodes
-                    ],
-                    timing=_trace_timing(trace),
-                )
+            if not self.standard_gepa:
+                record["timing"] = _trace_timing(trace)
             if trace.has_error:
                 record["error"] = str(trace.last_error)
             if trace.stop_condition:
