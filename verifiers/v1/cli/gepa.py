@@ -82,8 +82,6 @@ def main(argv: list[str] | None = None) -> None:
         fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise SystemExit("This experiment already has an active process") from None
-    if config.resume and (config.clean or config.dry_run):
-        raise SystemExit("resume cannot be combined with clean or dry-run")
     if config.clean and run_path.exists():
         output_dir = config.output_dir.resolve()
         resolved_run_path = run_path.resolve()
@@ -96,10 +94,12 @@ def main(argv: list[str] | None = None) -> None:
     # config included, which would destroy the existing traces' config provenance —
     # would overwrite the previous run.
     traces_file = run_path / TRACES_FILE
-    if not config.resume and traces_file.exists() and traces_file.stat().st_size > 0:
+    if (run_path / "gepa_state.bin").exists() or (
+        traces_file.exists() and traces_file.stat().st_size > 0
+    ):
         raise SystemExit(
             f"run directory {run_path} already contains results - "
-            "pick another --run.name or delete it"
+            "pick another --run.dir or use --clean"
         )
 
     if config.dry_run:  # resolved + validated; write it to the output dir and exit

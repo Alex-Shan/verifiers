@@ -6,7 +6,51 @@ individual tasksets define ad hoc ones inconsistently), so GEPA carves one out o
 disjoint slices.
 """
 
+from glob import has_magic, iglob
+from pathlib import Path
+
+from verifiers.v1.configs.select import SelectConfig
 from verifiers.v1.task import Task
+from verifiers.v1.taskset import Taskset
+
+
+def load_tasks_from_path(
+    taskset: Taskset, path: Path, select: SelectConfig
+) -> list[Task]:
+    """Load a JSONL file or glob through the configured taskset."""
+    if not path.is_file() and not (
+        has_magic(str(path))
+        and any(Path(match).is_file() for match in iglob(str(path), recursive=True))
+    ):
+        raise FileNotFoundError(f"GEPA dataset file not found: {path.resolve()}")
+
+    config = taskset.config.model_copy(update={"data_path": str(path)})
+    tasks = list(type(taskset)(config).select(select))
+    if not tasks:
+        raise ValueError(f"GEPA dataset selection produced no tasks: {path}")
+    return tasks
+
+
+def load_train_val_tasks(
+    taskset: Taskset,
+    select: SelectConfig,
+    num_train: int,
+    num_val: int,
+    train_path: Path | None,
+    val_path: Path | None,
+) -> tuple[list[Task], list[Task]]:
+    if train_path is None:
+        tasks = list(taskset.select(select).take(num_train + num_val))
+        return split_tasks(tasks, num_train, num_val)
+
+    assert val_path is not None
+    train_tasks = load_tasks_from_path(taskset, train_path, select)
+    val_tasks = load_tasks_from_path(taskset, val_path, select)
+    # Each taskset assigns indices independently, but GEPA shares a task lookup.
+    val_start = max(task.data.idx for task in train_tasks) + 1
+    return train_tasks, [
+        task.with_data(idx=idx) for idx, task in enumerate(val_tasks, start=val_start)
+    ]
 
 
 def split_tasks(

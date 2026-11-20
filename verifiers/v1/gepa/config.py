@@ -8,6 +8,7 @@ reflection model, train/val split, budget). GEPA always runs in-process, since i
 `GEPAAdapter`)."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SerializeAsAny, model_validator
 from pydantic_config import BaseConfig
@@ -52,6 +53,10 @@ class GEPAConfig(BaseConfig):
     select: SelectCLIConfig = SelectCLIConfig()
     """Which of the taskset's tasks GEPA splits into train/val, under `--select.*`
     (`-n` sets `select.limit`, `-s` sets `select.shuffle`)."""
+    train_tasks: Path | None = None
+    """A training JSONL file or glob. Set together with val_tasks."""
+    val_tasks: Path | None = None
+    """A validation JSONL file or glob. Set together with train_tasks."""
     num_train: int = Field(100, ge=1)
     """Tasks reserved for reflection minibatches (GEPA never scores the full trainset at once)."""
     num_val: int = Field(50, ge=1)
@@ -61,10 +66,21 @@ class GEPAConfig(BaseConfig):
     split comes from `select` (`-s` shuffles it under `select.seed`), so this doesn't
     change it."""
 
-    max_total_rollouts: int = Field(500)
-    """Total rollouts GEPA may spend across the whole optimization run."""
-    reflection_minibatch_size: int = 3
-    """Train tasks sampled per reflection step."""
+    max_total_rollouts: int | None = Field(None, ge=1)
+    """Rollout threshold checked between iterations. Defaults to 500 if no stop is set."""
+    max_iterations: int | None = Field(
+        None, ge=1, validation_alias=AliasChoices("max_iterations", "max_iteration")
+    )
+    """Maximum number of GEPA iterations after the seed validation."""
+    max_iterations_without_improvement: int | None = Field(None, ge=1)
+    """Stop after this many iterations without a better validation score."""
+    reflection_minibatch_size: int = Field(3, ge=1)
+    """Train tasks sampled per proposal."""
+    reflection_batch_sampler: Literal["epoch_shuffled", "cursor_epoch_shuffled"] = (
+        "epoch_shuffled"
+    )
+    proposal_parents: int = Field(1, ge=1)
+    mutations_per_parent: int = Field(1, ge=1)
     reflection_columns: list[str] = Field(default_factory=list)
     """Extra per-trace fields (from `trace.info`, else `task`) to surface to the teacher LM."""
     initial_prompt: str | None = None
@@ -82,13 +98,39 @@ class GEPAConfig(BaseConfig):
     `traces.jsonl`, alongside GEPA's own `candidates.json` / `run_log.json`) writes to
     `output_dir / run.dir`."""
     save_results: bool = True
+    clean: bool = Field(False, exclude=True)
+    """Delete the selected run directory before starting a fresh run."""
+    use_wandb: bool = False
+    wandb_project: str = "GEPA"
     verbose: bool = Field(False, validation_alias=AliasChoices("verbose", "v"))
     dry_run: bool = Field(False, exclude=True)
     """Resolve + validate the config and dump it, then exit. Excluded from the
     saved config so re-running `@ configs/gepa.json` runs for real."""
 
     @model_validator(mode="after")
-    def auto_setup_run_name(self):
+    def validate_run(self):
+        if (self.train_tasks is None) != (self.val_tasks is None):
+            raise ValueError("train_tasks and val_tasks must be set together")
+        if (
+            self.train_tasks is not None
+            and "data_path" not in type(self.env.taskset).model_fields
+        ):
+            raise ValueError("train_tasks/val_tasks require a taskset with data_path")
+
+        stop_values = (
+            self.max_total_rollouts,
+            self.max_iterations,
+            self.max_iterations_without_improvement,
+        )
+        stop_count = sum(value is not None for value in stop_values)
+        if stop_count > 1:
+            raise ValueError(
+                "Set only one of max_total_rollouts, max_iterations, "
+                "or max_iterations_without_improvement"
+            )
+        if stop_count == 0:
+            self.max_total_rollouts = 500
+
         if self.run.name is None:
             self.run.name = default_run_name(self.env, self.model)
         if self.run.dir is None:

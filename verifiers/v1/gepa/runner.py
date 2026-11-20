@@ -6,25 +6,28 @@ and everything is torn down in `finally`. Mirrors how v0 vf-gepa bridged sync GE
 rollouts — a Ctrl-C raises on the main thread inside `optimize()` and unwinds through teardown."""
 
 import asyncio
-import logging
+import random
+from contextlib import ExitStack
 
 from gepa.api import optimize
 from gepa.core.result import GEPAResult
+from gepa.strategies.proposal_sampling import PxNSampling
+from gepa.utils import MaxCandidateProposalsStopper, NoImprovementStopper
 
 from verifiers.v1.cli.output import output_path, save_config
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.env import Env
 from verifiers.v1.episode import Episode
 from verifiers.v1.gepa.adapter import GEPAAdapter
+from verifiers.v1.gepa.batch_sampler import CursorEpochShuffledBatchSampler
 from verifiers.v1.gepa.config import GEPAConfig
-from verifiers.v1.gepa.dataset import (
-    resolve_gepa_seed_prompt,
-    split_tasks,
-)
+from verifiers.v1.gepa.dataset import load_train_val_tasks, resolve_gepa_seed_prompt
 from verifiers.v1.gepa.reflection import build_reflection_lm
+from verifiers.v1.gepa.wandb_metrics import track_wandb_metrics
+from verifiers.v1.utils.logging import get_logger
 from verifiers.v1.utils.trace_store import append_episode
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class _GEPALog:
@@ -36,11 +39,32 @@ class _GEPALog:
         logger.info(message)
 
 
+def _stopping_kwargs(config: GEPAConfig) -> dict:
+    if config.max_total_rollouts is not None:
+        return {"max_metric_calls": config.max_total_rollouts}
+    if config.max_iterations is not None:
+        return {"stop_callbacks": MaxCandidateProposalsStopper(config.max_iterations)}
+    assert config.max_iterations_without_improvement is not None
+    return {
+        "stop_callbacks": NoImprovementStopper(
+            config.max_iterations_without_improvement
+        )
+    }
+
+
 def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
-    logger.info("gepa config:\n%s", config.model_dump_json(indent=2))
-    taskset = env.taskset.select(config.select)
-    all_tasks = list(taskset.take(config.num_train + config.num_val))
-    train_tasks, val_tasks = split_tasks(all_tasks, config.num_train, config.num_val)
+    logger.info("GEPA config:\n%s", config.model_dump_json(indent=2))
+    train_tasks, val_tasks = load_train_val_tasks(
+        env.taskset,
+        config.select,
+        config.num_train,
+        config.num_val,
+        config.train_tasks,
+        config.val_tasks,
+    )
+    logger.info(
+        "Loaded GEPA datasets train=%d validation=%d", len(train_tasks), len(val_tasks)
+    )
     selected_tasks = [*train_tasks, *val_tasks]
     # Seed from the tasks GEPA actually evaluates (train ∪ val), not the full pre-split pool —
     # a taskset with per-task system prompts could otherwise seed from a task in neither split.
@@ -48,10 +72,13 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
     tasks_by_idx = {task.data.idx: task for task in selected_tasks}
 
     run_dir = output_path(config) if config.save_results else None
+    reflective_dataset_path = None
     if run_dir is not None:
         save_config(
             config, run_dir, "gepa.json"
         )  # resolved config + a fresh traces.jsonl
+        reflective_dataset_path = run_dir / "reflective_dataset.jsonl"
+        reflective_dataset_path.write_bytes(b"")
         logger.info("results: %s", run_dir)
 
     # optimize() is synchronous and blocking, so it drives the run from this (main) thread. We
@@ -91,6 +118,7 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 semaphore=semaphore,
                 on_complete=on_complete,
                 reflection_columns=config.reflection_columns,
+                reflective_dataset_path=reflective_dataset_path,
             )
             optimize_kwargs: dict = {
                 "seed_candidate": {"system_prompt": seed_prompt},
@@ -98,15 +126,34 @@ def run_gepa(env: Env, config: GEPAConfig) -> GEPAResult:
                 "valset": [task.data.idx for task in val_tasks],
                 "adapter": adapter,
                 "reflection_lm": reflection_lm,
-                "max_metric_calls": config.max_total_rollouts,
+                **_stopping_kwargs(config),
                 "reflection_minibatch_size": config.reflection_minibatch_size,
+                "sampling_strategy": PxNSampling(
+                    p=config.proposal_parents, n=config.mutations_per_parent
+                ),
                 "run_dir": str(run_dir) if run_dir is not None else None,
                 "seed": config.seed,
                 "display_progress_bar": False,
                 "skip_perfect_score": False,
                 "logger": _GEPALog(),
             }
-            result = optimize(**optimize_kwargs)
+            if config.reflection_batch_sampler == "cursor_epoch_shuffled":
+                optimize_kwargs.update(
+                    batch_sampler=CursorEpochShuffledBatchSampler(
+                        config.reflection_minibatch_size, rng=random.Random(config.seed)
+                    ),
+                    reflection_minibatch_size=None,
+                )
+            with ExitStack() as tracking:
+                if config.use_wandb:
+                    optimize_kwargs["callbacks"] = [
+                        tracking.enter_context(
+                            track_wandb_metrics(
+                                config, run_dir, len(train_tasks), len(val_tasks)
+                            )
+                        )
+                    ]
+                result = optimize(**optimize_kwargs)
             if run_dir is not None:
                 # Persist the winning prompt as a plain file so it can be handed straight to
                 # eval/train via `--env.taskset.system-prompt` (see TasksetConfig).

@@ -11,10 +11,12 @@ thread, so a Ctrl-C unwinds straight through `optimize()` into the runner's tear
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from gepa.core.adapter import EvaluationBatch
-from pydantic_core import to_jsonable_python
+from pydantic import TypeAdapter
+from pydantic_core import to_json, to_jsonable_python
 
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.env import Env
@@ -22,6 +24,7 @@ from verifiers.v1.episode import Episode
 from verifiers.v1.task import Task
 
 Candidate = dict[str, str]
+_reflective_row = TypeAdapter(dict[str, Any])
 
 
 @dataclass
@@ -47,6 +50,9 @@ class GEPAAdapter:
     step. None = use GEPA's default reflection-LM proposer (the AttributeError from leaving it
     undeclared silently disables all mutation proposals)."""
 
+    reflective_dataset_path: Path | None = None
+    _reflection_batch: int = field(default=0, init=False)
+
     def evaluate(
         self,
         batch: list[int],
@@ -58,13 +64,35 @@ class GEPAAdapter:
         aligned however many traces the env's episode holds. Called synchronously by GEPA on
         the main thread; each batch's rollouts run on the runner's persistent loop via
         `run_until_complete`."""
-        system_prompt = candidate.get("system_prompt", "")
-        episodes = self.loop.run_until_complete(self._run_batch(batch, system_prompt))
-        scores = [_episode_score(episode) for episode in episodes]
+        return self.loop.run_until_complete(
+            self._evaluate(batch, candidate, capture_traces)
+        )
+
+    def batch_evaluate(
+        self, items: list[tuple[Candidate, list[int]]]
+    ) -> list[EvaluationBatch[Episode, Episode]]:
+        """Evaluate all proposals in one stage under the shared rollout semaphore."""
+        return self.loop.run_until_complete(self._evaluate_many(items))
+
+    async def _evaluate_many(
+        self, items: list[tuple[Candidate, list[int]]]
+    ) -> list[EvaluationBatch[Episode, Episode]]:
+        async with asyncio.TaskGroup() as group:
+            jobs = [
+                group.create_task(self._evaluate(batch, candidate, True))
+                for candidate, batch in items
+            ]
+        return [job.result() for job in jobs]
+
+    async def _evaluate(
+        self, batch: list[int], candidate: Candidate, capture_traces: bool
+    ) -> EvaluationBatch[Episode, Episode]:
+        episodes = await self._run_batch(batch, candidate.get("system_prompt", ""))
         return EvaluationBatch(
             outputs=episodes,
-            scores=scores,
+            scores=[_episode_score(episode) for episode in episodes],
             trajectories=episodes if capture_traces else None,
+            num_metric_calls=len(episodes),
         )
 
     async def _run_batch(self, batch: list[int], system_prompt: str) -> list[Episode]:
@@ -73,13 +101,14 @@ class GEPAAdapter:
         # the shared base task in `self.tasks` is left untouched for the next candidate).
         tasks = [self.tasks[idx].with_system_prompt(system_prompt) for idx in batch]
         slots = [slot for task in tasks for slot in self.env.slots(task)]
-        results = await asyncio.gather(
-            *(
-                self.env.run_slot(slot, self.ctx, self.semaphore, self.on_complete)
+        async with asyncio.TaskGroup() as group:
+            rollouts = [
+                group.create_task(
+                    self.env.run_slot(slot, self.ctx, self.semaphore, self.on_complete)
+                )
                 for slot in slots
-            )
-        )
-        return list(results)
+            ]
+        return [rollout.result() for rollout in rollouts]
 
     def make_reflective_dataset(
         self,
@@ -97,7 +126,7 @@ class GEPAAdapter:
             for trace in episode.traces:
                 record: dict[str, Any] = {
                     "query": trace.task.data.prompt_text,
-                    "completion": trace.last_reply,
+                    "completion": trace.nodes,  # This must be `trace.nodes`, not `trace.last_replay`.
                     "reward": trace.reward,
                 }
                 record["agent"] = trace.agent.name
@@ -113,6 +142,18 @@ class GEPAAdapter:
                             getattr(trace.task.data, column)
                         )
                 records.append(record)
+        if (
+            self.reflective_dataset_path is not None
+            and records
+            and components_to_update
+        ):
+            self._reflection_batch += 1
+            with self.reflective_dataset_path.open("ab") as dataset:
+                for record in records:
+                    row = {**record, "reflection_batch": self._reflection_batch}
+                    # Preserve binary node fields before encoding their bytes as JSON.
+                    data = _reflective_row.dump_python(row)
+                    dataset.write(to_json(data, bytes_mode="base64") + b"\n")
         return {comp: records for comp in components_to_update}
 
 

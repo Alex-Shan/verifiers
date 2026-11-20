@@ -1,18 +1,43 @@
-"""The reflection (teacher) LM: GEPA's proposer calls this synchronously to turn a prompt into
-text. Backed by a vf `Judge` — `Judge.complete` owns the model client (same key / header /
-Prime-billing resolution rollouts use), so we never build one here. GEPA calls it from the
-worker thread running `optimize()`, so each call drives the async `complete` on a private loop.
-"""
+"""Run GEPA's teacher completions through the v1 Judge client."""
 
 import asyncio
-from collections.abc import Callable
 
 from verifiers.v1.configs.judge import JudgeConfig
+from verifiers.v1.dialects.chat import parse_message
 from verifiers.v1.gepa.config import GEPAConfig
 from verifiers.v1.judge import Judge
 
+ReflectionPrompt = str | list[dict]
 
-def build_reflection_lm(config: GEPAConfig) -> Callable[[str], str]:
+
+class ReflectionLM:
+    """Support GEPA's single and batch completion paths with one Judge."""
+
+    def __init__(self, judge: Judge):
+        self.judge = judge
+
+    def __call__(self, prompt: ReflectionPrompt) -> str:
+        return asyncio.run(self._complete(prompt))
+
+    def batch_complete(self, prompts: list[ReflectionPrompt]) -> list[str]:
+        return asyncio.run(self._complete_many(prompts))
+
+    async def _complete_many(self, prompts: list[ReflectionPrompt]) -> list[str]:
+        async with asyncio.TaskGroup() as group:
+            calls = [group.create_task(self._complete(prompt)) for prompt in prompts]
+        return [call.result() for call in calls]
+
+    async def _complete(self, prompt: ReflectionPrompt) -> str:
+        messages = (
+            prompt
+            if isinstance(prompt, str)
+            else [parse_message(msg) for msg in prompt]
+        )
+        response = await self.judge.complete(messages)
+        return response.text
+
+
+def build_reflection_lm(config: GEPAConfig) -> ReflectionLM:
     client = config.reflection_client or config.client
     judge = Judge(
         JudgeConfig(
@@ -24,8 +49,4 @@ def build_reflection_lm(config: GEPAConfig) -> Callable[[str], str]:
             timeout=client.timeout,
         )
     )
-
-    def reflection_lm(prompt: str) -> str:
-        return asyncio.run(judge.complete(prompt)).text
-
-    return reflection_lm
+    return ReflectionLM(judge)
